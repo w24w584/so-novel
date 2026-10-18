@@ -98,7 +98,7 @@ public class DownloadAction {
             }
             if (action == 4) continue;
 
-            new Crawler(APP_CONFIG).crawl(sr.getUrl(), toc);
+            new Crawler(APP_CONFIG).crawl(sr.getUrl(), toc, sr.getBookName(), sr.getAuthor());
         }
     }
 

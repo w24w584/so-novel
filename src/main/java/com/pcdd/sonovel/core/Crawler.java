@@ -48,6 +48,17 @@ public class Crawler {
     }
 
     public double crawl(String bookUrl) {
+        return crawl(bookUrl, null, null);
+    }
+
+    /**
+     * 爬取小说
+     *
+     * @param bookUrl  详情页链接
+     * @param bookName 搜索结果中的书名，详情页书名规则缺失或失效时兜底
+     * @param author   搜索结果中的作者，详情页作者规则缺失或失效时兜底
+     */
+    public double crawl(String bookUrl, String bookName, String author) {
         TocParser tocParser = new TocParser(config);
         List<Chapter> toc = tocParser.parseAll(bookUrl);
         // 大概率是部分书源的目录页有反爬导致
@@ -56,20 +67,26 @@ public class Crawler {
             return 0;
         }
         Console.log("<== 共计 {} 章", toc.size());
-        return crawl(bookUrl, toc);
+        return crawl(bookUrl, toc, bookName, author);
+    }
+
+    public double crawl(String bookUrl, List<Chapter> toc) {
+        return crawl(bookUrl, toc, null, null);
     }
 
     /**
      * 爬取小说
      *
-     * @param bookUrl 详情页链接
-     * @param toc     章节目录
+     * @param bookUrl  详情页链接
+     * @param toc      章节目录
+     * @param bookName 搜索结果中的书名，详情页书名规则缺失或失效时兜底
+     * @param author   搜索结果中的作者，详情页作者规则缺失或失效时兜底
      * @return 总耗时
      */
     @SneakyThrows
-    public double crawl(String bookUrl, List<Chapter> toc) {
+    public double crawl(String bookUrl, List<Chapter> toc, String bookName, String author) {
         digitCount = String.valueOf(toc.size()).length();
-        Book book = new BookParser(config).parse(bookUrl);
+        Book book = new BookParser(config).parse(bookUrl, bookName, author);
         BookContext.set(book);
 
         // 下载临时目录名格式：书名 (作者) EXT
