@@ -21,8 +21,12 @@ const Api = {
       if (!r.ok || !r.body) throw new Error('搜索请求失败，请检查服务是否正常')
       const reader = r.body.getReader()
       const decoder = new TextDecoder('utf-8')
+      let cancelled = false
       return {
-        cancel: () => reader.cancel(),
+        cancel: () => {
+          cancelled = true
+          return reader.cancel().catch(() => {})
+        },
         stream: async ({ onPage, onProgress, onDone, onError }) => {
           let buffer = ''
           let gotData = false
@@ -55,9 +59,10 @@ const Api = {
                 }
               }
             }
-            if (!gotData) onError && onError(new Error('没有返回搜索结果'))
+            if (!gotData && !cancelled) onError && onError(new Error('没有返回搜索结果'))
           } catch (e) {
-            onError && onError(e)
+            // 用户主动取消时不上报错误
+            if (!cancelled) onError && onError(e)
           }
         }
       }
