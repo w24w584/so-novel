@@ -77,8 +77,8 @@ public class AggregatedSearchServlet extends HttpServlet {
             List<SearchResult> finalResults = AggregatedSearchAction.streamSearch(
                     name, shareSourceIds, mainSourceIds, precision,
                     batch -> sendSse(out, writeLock, closed, pageEvent(batch)),
-                    (done, total, found) ->
-                            sendSse(out, writeLock, closed, progressEvent(done, total, found)));
+                    (done, total, found, failed) ->
+                            sendSse(out, writeLock, closed, progressEvent(done, total, found, failed)));
 
             sendSse(out, writeLock, closed, doneEvent(finalResults, maxResults));
         } catch (Exception e) {
@@ -183,12 +183,13 @@ public class AggregatedSearchServlet extends HttpServlet {
         return evt.toString();
     }
 
-    private String progressEvent(int done, int total, int found) {
+    private String progressEvent(int done, int total, int found, int failed) {
         JSONObject evt = new JSONObject();
         evt.set("type", "stream_progress");
         evt.set("done", done);
         evt.set("total", total);
         evt.set("found", found);
+        evt.set("failed", failed);
         return evt.toString();
     }
 

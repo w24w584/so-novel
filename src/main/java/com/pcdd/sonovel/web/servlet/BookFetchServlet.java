@@ -6,6 +6,7 @@ import cn.hutool.core.util.StrUtil;
 import com.pcdd.sonovel.core.AppConfigLoader;
 import com.pcdd.sonovel.core.Crawler;
 import com.pcdd.sonovel.model.AppConfig;
+import com.pcdd.sonovel.model.Rule;
 import com.pcdd.sonovel.model.SearchResult;
 import com.pcdd.sonovel.utils.SourceUtils;
 import com.pcdd.sonovel.web.util.RespUtils;
@@ -31,7 +32,13 @@ public class BookFetchServlet extends HttpServlet {
             String format = req.getParameter("format");
             String language = req.getParameter("language");
             String concurrencyStr = req.getParameter("concurrency");
-            int id = SourceUtils.getRule(bookUrl).getId();
+            Rule rule = SourceUtils.getRule(bookUrl);
+            if (rule.isSearchOnly()) {
+                RespUtils.writeError(resp, 400, StrUtil.blankToDefault(rule.getSearchOnlyReason(),
+                        "该分享书源不支持下载，请更换书源") + "（书源：" + rule.getName() + "）");
+                return;
+            }
+            int id = rule.getId();
 
             if (StrUtil.isNotBlank(format) && !ALLOWED_FORMATS.contains(format.toLowerCase())) {
                 RespUtils.writeError(resp, 400, "不支持的下载格式: " + format + "，可选R: epub, txt, html, pdf");

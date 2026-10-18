@@ -189,6 +189,10 @@
                           class="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 border border-gray-200/80 whitespace-nowrap"
                           :title="s.disabledReason || '该额外书源不可用'"
                           x-text="s.disabledReason ? '不可用' : ''"></span>
+                    <span x-show="!s.disabled && s.searchOnly"
+                          class="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200 whitespace-nowrap"
+                          :title="s.searchOnlyReason || '该分享书源缺少可用的目录/正文规则，仅支持搜索'"
+                          x-text="'仅搜索'"></span>
                   </span>
                   <span class="text-xs truncate"
                         :class="s.disabled ? 'text-gray-300' : 'text-gray-400'"
@@ -256,7 +260,7 @@
             <span x-text="searchScanTotal > 0 ? '正在聚合搜索' : '正在准备搜索...'"></span>
           </span>
           <span x-text="searchScanTotal > 0
-            ? `已扫描 ${searchScanDone}/${searchScanTotal} 个书源 · 命中 ${searchFoundCount} 条`
+            ? `已扫描 ${searchScanDone}/${searchScanTotal} 个书源 · 命中 ${searchFoundCount} 条${searchFailedCount > 0 ? ` · 失败 ${searchFailedCount} 个` : ''}`
             : '正在获取书源...'"></span>
         </div>
         <div class="h-1.5 w-full overflow-hidden rounded-full bg-gray-200">
@@ -741,6 +745,7 @@
       searchScanDone: 0,
       searchScanTotal: 0,
       searchFoundCount: 0,
+      searchFailedCount: 0,
       _noticeSeq: 0,
       _searchCancel: null,
       _searchCancelled: false,
@@ -986,6 +991,7 @@
         this.searchScanDone = 0
         this.searchScanTotal = 0
         this.searchFoundCount = 0
+        this.searchFailedCount = 0
         try {
           // 显式收集当前勾选的 main 书源 id，保证“取消勾选 main”能被后端识别（为空表示不搜任何 main）
           // 未展开过设置（尚未初始化 main 选择）时不传 mainSourceIds，后端默认全部 main 参与搜索
@@ -1006,10 +1012,11 @@
               if (!page || !page.length) return
               this.bookCache = this.bookCache.concat(page)
             },
-            onProgress: (done, total, found) => {
+            onProgress: (done, total, found, failed) => {
               this.searchScanDone = done
               this.searchScanTotal = total
               this.searchFoundCount = found
+              this.searchFailedCount = failed
             },
             onDone: () => {
               if (this._searchCancelled) return

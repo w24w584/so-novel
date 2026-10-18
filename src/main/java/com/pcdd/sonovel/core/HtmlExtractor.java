@@ -102,6 +102,9 @@ public class HtmlExtractor {
         if (StrUtil.isBlank(query)) return null;
         if (query.contains("@href")) return ContentType.ATTR_HREF;
         if (query.contains("@src")) return ContentType.ATTR_SRC;
+        // 仅按结尾后缀匹配，避免误伤 XPath 中的 [@value="..."] 谓词
+        if (query.endsWith("@content")) return ContentType.ATTR_CONTENT;
+        if (query.endsWith("@value")) return ContentType.ATTR_VALUE;
         if (query.startsWith("meta[")) return ContentType.ATTR_CONTENT;
         return ContentType.TEXT;
     }

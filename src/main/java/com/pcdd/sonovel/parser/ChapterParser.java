@@ -34,6 +34,10 @@ public class ChapterParser extends Source {
     }
 
     public Chapter parse(Chapter chapter) {
+        if (rule.getChapter() == null) {
+            Console.error("<== 书源 {} 缺少正文规则（可能为 JS 规则），跳过章节：{}", rule.getName(), chapter.getTitle());
+            return null;
+        }
         try {
             long interval = CrawlUtils.randomInterval(config);
             LogUtils.logByProgressbar(LogLevel.INFO, config.getEnableProgressbar(),
@@ -48,10 +52,10 @@ public class ChapterParser extends Source {
             return ChineseConverter.convert(chapterRenderer.process(chapter), this.rule.getLanguage(), config.getLanguage());
 
         } catch (Exception e) {
-            // 中断下载，不重试
+            // 中断下载，不重试（Web 服务场景下不能 System.exit，否则会杀掉整个进程）
             if (config.getEnableRetry() == 0) {
                 Console.error(e, "【{}】章节下载出错。因未启用重试，故中断下载", chapter.getTitle());
-                System.exit(1);
+                return null;
             }
             Chapter retryChapter = retry(chapter, e);
             return retryChapter == null ? null : ChineseConverter.convert(retryChapter, this.rule.getLanguage(), config.getLanguage());
