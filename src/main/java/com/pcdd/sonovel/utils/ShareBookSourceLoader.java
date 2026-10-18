@@ -1,0 +1,658 @@
+package com.pcdd.sonovel.utils;
+
+import cn.hutool.core.io.FileUtil;
+import cn.hutool.core.lang.Console;
+import cn.hutool.core.util.CharsetUtil;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
+import cn.hutool.json.JSONUtil;
+import com.pcdd.sonovel.model.Rule;
+import lombok.experimental.UtilityClass;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@UtilityClass
+public class ShareBookSourceLoader {
+
+    private final Pattern SHARE_FILE = Pattern.compile("shareBookSource\\.\\d+\\.json");
+    private final Pattern REQUEST_OPTIONS = Pattern.compile(",\\s*(\\{.*})\\s*$", Pattern.DOTALL);
+
+    private static volatile List<ShareFile> cachedFiles;
+    /** 加载时的书源文件指纹（文件名+最后修改时间），用于检测磁盘 JSON 变更后自动失效缓存 */
+    private static volatile String cachedFingerprint;
+
+    /** 读取后的规则缓存，避免每次搜索都重新解析磁盘上的全部额外书源文件。 */
+    private List<ShareFile> getFiles() {
+        List<ShareFile> files = cachedFiles;
+        String fresh = filesFingerprint();
+        if (files == null || !java.util.Objects.equals(fresh, cachedFingerprint)) {
+            synchronized (ShareBookSourceLoader.class) {
+                String recheck = filesFingerprint();
+                if (cachedFiles == null || !java.util.Objects.equals(recheck, cachedFingerprint)) {
+                    cachedFingerprint = recheck;
+                    cachedFiles = loadFiles();
+                }
+                files = cachedFiles;
+            }
+        }
+        return files;
+    }
+
+    /** 计算所有分享书源文件的指纹：文件名:最后修改时间 拼接。文件改动/增删都会使指纹变化。 */
+    private String filesFingerprint() {
+        StringBuilder sb = new StringBuilder();
+        for (File file : discoverShareFiles()) {
+            sb.append(file.getName()).append(':')
+                    .append(FileUtil.lastModifiedTime(file)).append(';');
+        }
+        return sb.toString();
+    }
+
+    private List<ShareFile> loadFiles() {
+        File directory = resolveRulesDirectory();
+        Console.log("[书源] 开始加载分享书源，实际目录: {}（工作目录: {}）",
+                directory == null ? "null" : directory.getAbsolutePath(),
+                new File("").getAbsolutePath());
+        if (directory == null) {
+            return List.of();
+        }
+
+        return discoverShareFiles().stream()
+                .map(file -> new ShareFile(file.getName(), readSources(file)))
+                .toList();
+    }
+
+    public List<Map<String, Object>> listSourcesGrouped() {
+        List<Map<String, Object>> grouped = new ArrayList<>();
+        for (ShareFile file : getFiles()) {
+            Map<String, Object> group = new LinkedHashMap<>();
+            group.put("file", file.name());
+            List<Map<String, Object>> sourcesInFile = new ArrayList<>();
+            for (int i = 0; i < file.sources().size(); i++) {
+                Rule s = file.sources().get(i);
+                sourcesInFile.add(buildSourceItem(file.name(), i, s));
+            }
+            group.put("sources", sourcesInFile);
+            grouped.add(group);
+        }
+        return grouped;
+    }
+
+    /**
+     * 构造前端书源条目。{@code index} 为文件内下标；内置(main)书源传入其规则 id。
+     */
+    public Map<String, Object> buildSourceItem(String fileName, int index, Rule s) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("sourceId", fileName + "#" + index);
+        item.put("file", fileName);
+        item.put("indexInFile", index);
+        item.put("name", s.getName());
+        item.put("url", s.getUrl());
+        item.put("disabled", s.isDisabled());
+        if (StrUtil.isNotBlank(s.getDisabledReason())) {
+            item.put("disabledReason", s.getDisabledReason());
+        }
+        if (StrUtil.isNotBlank(s.getComment())) {
+            item.put("comment", s.getComment());
+        }
+        return item;
+    }
+
+    public List<Rule> loadAll(int baseRuleCount) {
+        return loadSelected(Set.of(), baseRuleCount, true);
+    }
+
+    public List<Rule> loadSelected(Set<String> selectedSourceIds, int baseRuleCount) {
+        return loadSelected(selectedSourceIds, baseRuleCount, false);
+    }
+
+    private List<Rule> loadSelected(Set<String> selectedSourceIds, int baseRuleCount, boolean includeAll) {
+        List<Rule> result = new ArrayList<>();
+        int sourceIndex = 0;
+        for (ShareFile file : getFiles()) {
+            for (int i = 0; i < file.sources().size(); i++) {
+                Rule source = file.sources().get(i);
+                sourceIndex++;
+                if (source.isDisabled()) continue;
+                source.setId(baseRuleCount + sourceIndex);
+                source.setSourceGroup(file.name());
+                String sourceId = file.name() + "#" + i;
+                if (includeAll || selectedSourceIds.contains(sourceId)) {
+                    result.add(source);
+                }
+            }
+        }
+        return result;
+    }
+
+    public Rule findById(int id, int baseRuleCount) {
+        if (id <= baseRuleCount) return null;
+        return loadAll(baseRuleCount).stream().filter(source -> source.getId() == id).findFirst().orElse(null);
+    }
+
+    public Rule findByUrl(String url, int baseRuleCount) {
+        return loadAll(baseRuleCount).stream()
+                .filter(source -> StrUtil.startWith(url, source.getUrl()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private File resolveRulesDirectory() {
+        List<String> candidates = new ArrayList<>();
+        candidates.add("rules");
+        candidates.add("bundle/rules");
+        candidates.add("runtime/../rules");
+        candidates.add("dist/SoNovel/rules");
+        candidates.add("dist/rules");
+
+        for (String candidate : candidates) {
+            File dir = new File(candidate);
+            if (dir.isDirectory()) {
+                return dir;
+            }
+        }
+        return null;
+    }
+
+    private List<Rule> readSources(File file) {
+        JSONArray items = readJsonItems(file);
+
+        List<Rule> result = new ArrayList<>();
+        if (items == null) return result;
+        for (Object value : items) {
+            if (!(value instanceof JSONObject item)) continue;
+            Rule source;
+            try {
+                source = toRule(item);
+            } catch (Exception e) {
+                // 单个书源解析异常不能拖垮整份书源列表，仍保留为禁用条目供展示
+                source = buildRuleFallback(item, "书源解析异常：(" + e.getClass().getSimpleName() + ") " + e.getMessage());
+            }
+            if (source == null) {
+                // toRule 未返回可用规则时也保留条目，保证该书源在设置页可见
+                source = buildRuleFallback(item, "缺少可用的书源规则");
+            }
+            result.add(source);
+        }
+        return result;
+    }
+
+    private Rule buildRuleFallback(JSONObject item, String reason) {
+        return markDisabled(buildSkeletonFallback(item), reason);
+    }
+
+    private JSONArray parseLenient(File file) {
+        JSONArray result = new JSONArray();
+        try {
+            String text = FileUtil.readString(file, CharsetUtil.CHARSET_UTF_8);
+            Pattern pattern = Pattern.compile(
+                    "\"bookSourceName\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"[\\s\\S]{0,8000}?\"bookSourceUrl\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+            Matcher matcher = pattern.matcher(text);
+            while (matcher.find()) {
+                JSONObject item = new JSONObject();
+                item.set("bookSourceName", matcher.group(1));
+                item.set("bookSourceUrl", matcher.group(2));
+                item.set("bookSourceType", 0);
+                item.set("enabled", true);
+                result.add(item);
+            }
+        } catch (Exception ignored) {
+        }
+        return result;
+    }
+
+    private Rule toRule(JSONObject item) {
+        Rule skeleton = buildSkeleton(item);
+        boolean skeletonUsable = skeleton != null;
+
+        if (item.getInt("bookSourceType", 0) != 0) {
+            return markDisabled(skeletonUsable ? skeleton : buildSkeletonFallback(item), "不支持的书源类型（非0）");
+        }
+        if (!item.getBool("enabled", true)) {
+            return markDisabled(skeletonUsable ? skeleton : buildSkeletonFallback(item), "原始配置已禁用");
+        }
+
+        JSONObject search = item.getJSONObject("ruleSearch");
+        String searchUrl = item.getStr("searchUrl");
+        if (search == null || StrUtil.isBlank(searchUrl)
+                || !StrUtil.isAllNotBlank(search == null ? null : search.getStr("bookList"),
+                search == null ? null : search.getStr("bookUrl"),
+                search == null ? null : search.getStr("name"))) {
+            return markDisabled(skeletonUsable ? skeleton : buildSkeletonFallback(item), "缺少有效搜索规则");
+        }
+
+        if (search.getStr("bookList").contains("<js>") || search.getStr("bookUrl").contains("<js>")) {
+            return markDisabled(skeletonUsable ? skeleton : buildSkeletonFallback(item), "搜索规则包含不支持的 <js> 代码");
+        }
+
+        Rule rule = skeleton;
+        if (rule == null) {
+            return buildSkeletonFallback(item);
+        }
+        rule.setShareSource(true);
+
+        Rule.Search searchRule = new Rule.Search();
+        boolean hasAtJs = searchUrl.contains("@js:");
+        boolean hasAngleBracketJs = searchUrl.trim().startsWith("<js>");
+
+        if (hasAtJs || hasAngleBracketJs) {
+            if (hasAngleBracketJs) {
+                searchUrl = "@js:" + StrUtil.subBetween(searchUrl, "<js>", "</js>");
+            }
+            searchRule.setUrl(searchUrl);
+            searchRule.setMethod("get");
+        } else {
+            ParsedRequest request = parseRequest(searchUrl, rule.getUrl());
+            if (request == null) {
+                rule.setDisabled(true);
+                rule.setDisabledReason("搜索链接无法解析（缺少 {{key}} 模板或格式不支持）");
+                return rule;
+            }
+            searchRule.setUrl(request.url());
+            searchRule.setMethod(request.method());
+            searchRule.setData(request.data());
+            searchRule.setCharset(request.charset());
+        }
+
+        searchRule.setHeaders(readHeaders(item.getStr("header")));
+        searchRule.setResult(toSelector(search.getStr("bookList")));
+        searchRule.setBookName(toSelector(search.getStr("name")));
+        searchRule.setAuthor(toSelector(search.getStr("author")));
+        searchRule.setCategory(toSelector(search.getStr("kind")));
+        searchRule.setLatestChapter(toSelector(search.getStr("lastChapter")));
+        searchRule.setLastUpdateTime(toSelector(search.getStr("lastUpdateTime")));
+        searchRule.setStatus(toSelector(search.getStr("status")));
+        searchRule.setWordCount(toSelector(search.getStr("wordCount")));
+        searchRule.setBaseUri(rule.getUrl());
+        rule.setSearch(searchRule);
+
+        JSONObject book = item.getJSONObject("ruleBookInfo");
+        if (book != null) {
+            Rule.Book bookRule = new Rule.Book();
+            bookRule.setBaseUri(rule.getUrl());
+            bookRule.setUrl(rule.getUrl());
+            bookRule.setBookName(toSelector(book.getStr("name")));
+            bookRule.setAuthor(toSelector(book.getStr("author")));
+            bookRule.setIntro(toSelector(book.getStr("intro")));
+            bookRule.setCategory(toSelector(book.getStr("kind")));
+            bookRule.setCoverUrl(toSelector(book.getStr("coverUrl")));
+            bookRule.setLatestChapter(toSelector(book.getStr("lastChapter")));
+            bookRule.setLatestChapterUrl(toSelector(book.getStr("tocUrl")));
+            rule.setBook(bookRule);
+        }
+
+        JSONObject toc = item.getJSONObject("ruleToc");
+        if (toc != null && StrUtil.isNotBlank(toc.getStr("chapterList")) && !toc.getStr("chapterList").contains("<js>")) {
+            Rule.Toc tocRule = new Rule.Toc();
+            tocRule.setBaseUri(rule.getUrl());
+            tocRule.setItem(toSelector(toc.getStr("chapterList")));
+            tocRule.setNextPageUrl(toSelector(resolvePagingSelector(toc)));
+            tocRule.setDesc(false);
+            rule.setToc(tocRule);
+        }
+
+        JSONObject content = item.getJSONObject("ruleContent");
+        if (content != null && StrUtil.isNotBlank(content.getStr("content"))
+                && !content.getStr("content").contains("<js>")) {
+            Rule.Chapter chapterRule = new Rule.Chapter();
+            chapterRule.setBaseUri(rule.getUrl());
+            chapterRule.setContent(toSelector(content.getStr("content")));
+            String nextContent = resolvePaging(content, "nextContentUrl");
+            if (StrUtil.isNotBlank(nextContent)) {
+                chapterRule.setNextPage(toSelector(nextContent));
+            }
+            rule.setChapter(chapterRule);
+        }
+        return rule;
+    }
+
+    private Rule buildSkeleton(JSONObject item) {
+        String baseUrl = getBaseUrl(item.getStr("bookSourceUrl"));
+        String name = item.getStr("bookSourceName");
+        if (StrUtil.isBlank(name) || StrUtil.isBlank(baseUrl)) return null;
+
+        Rule rule = new Rule();
+        rule.setName(name);
+        rule.setComment(item.getStr("bookSourceComment"));
+        rule.setUrl(baseUrl);
+        return rule;
+    }
+
+    private Rule buildSkeletonFallback(JSONObject item) {
+        Rule rule = buildSkeleton(item);
+        if (rule == null) {
+            rule = new Rule();
+            rule.setName(StrUtil.blankToDefault(item.getStr("bookSourceName"), "(未知名称)"));
+            rule.setUrl(getBaseUrl(item.getStr("bookSourceUrl")));
+            rule.setComment(item.getStr("bookSourceComment"));
+        }
+        rule.setDisabled(true);
+        rule.setDisabledReason("缺少书源名称或主页URL");
+        return rule;
+    }
+
+    private Rule markDisabled(Rule rule, String reason) {
+        if (rule == null) return null;
+        rule.setDisabled(true);
+        rule.setDisabledReason(reason);
+        return rule;
+    }
+
+    private ParsedRequest parseRequest(String searchUrl, String baseUrl) {
+        Matcher matcher = REQUEST_OPTIONS.matcher(searchUrl);
+        JSONObject options = null;
+        String url = searchUrl;
+        if (matcher.find()) {
+            url = searchUrl.substring(0, matcher.start());
+            try {
+                options = JSONUtil.parseObj(normalizeOptions(matcher.group(1)));
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        url = simplifyShareExpressions(url);
+        if (!url.contains("{{key}}")) return null;
+        url = url.replace("{{key}}", "%s").replace("{{page}}", "1");
+        if (url.startsWith("/")) url = baseUrl + url;
+
+        String method = options == null ? "get" : options.getStr("method", "get");
+        String charset = options == null ? null : options.getStr("charset");
+        String data = null;
+        if (options != null && options.get("body") != null) {
+            Object body = options.get("body");
+            Map<String, Object> form = new LinkedHashMap<>();
+            if (body instanceof JSONObject bodyObject) {
+                bodyObject.forEach((key, value) -> form.put(key, String.valueOf(value).replace("{{key}}", "%s")));
+            } else {
+                String bodyText = String.valueOf(body).replace("{{key}}", "%s");
+                for (String pair : bodyText.split("&")) {
+                    String[] parts = pair.split("=", 2);
+                    if (parts.length == 2) form.put(parts[0], parts[1]);
+                }
+            }
+            if (form.isEmpty()) return null;
+            data = JSONUtil.toJsonStr(form);
+        }
+        if (StrUtil.isBlank(url) || ("post".equalsIgnoreCase(method) && data == null)) return null;
+        return new ParsedRequest(url, method, data, charset);
+    }
+
+    private String simplifyShareExpressions(String url) {
+        StringBuilder result = new StringBuilder();
+        Matcher m = Pattern.compile("\\{\\{(.*?)\\}\\}").matcher(url);
+        int last = 0;
+        while (m.find()) {
+            result.append(url, last, m.start());
+            String expr = m.group(1).trim();
+            if (expr.contains("key")) {
+                result.append("{{key}}");
+            } else if (expr.contains("page")) {
+                result.append("{{page}}");
+            }
+            last = m.end();
+        }
+        result.append(url.substring(last));
+        return result.toString();
+    }
+
+    private String normalizeOptions(String options) {
+        String normalized = options.replaceAll("'((?:\\\\.|[^'\\\\])*)'", "\"$1\"")
+                .replaceAll("([,{]\\s*)([A-Za-z_$][\\w$-]*)(\\s*:)", "$1\"$2\"$3");
+        return normalized.replaceAll(",\\s*([}\\]])", "$1");
+    }
+
+    private Map<String, String> readHeaders(String header) {
+        if (StrUtil.isBlank(header) || header.contains("@js:") || header.contains("<js>")) return Map.of();
+        try {
+            JSONObject object = JSONUtil.parseObj(header);
+            Map<String, String> headers = new LinkedHashMap<>();
+            object.forEach((key, value) -> headers.put(key, String.valueOf(value)));
+            return headers;
+        } catch (Exception ignored) {
+            return Map.of();
+        }
+    }
+
+    /** 从 ruleContent/ruleToc 等块中解析单条分页/翻页规则（兼容字符串/数组/js 对象，跳过依赖 JS 的动态规则） */
+    private String resolvePaging(JSONObject obj, String key) {
+        if (obj == null) return null;
+        String s = firstSelector(obj.get(key));
+        if (s == null) return null;
+        s = s.trim();
+        if (s.startsWith("@js:") || s.contains("<js>")) return null;
+        return s;
+    }
+
+    /** 兼容 legado ruleToc.nextTocUrl / ruleToc.nextPage 可能为字符串或数组 */
+    private String resolvePagingSelector(JSONObject toc) {
+        if (toc == null) return null;
+        Object nextToc = toc.get("nextTocUrl");
+        if (nextToc == null) nextToc = toc.get("nextPage");
+        return firstSelector(nextToc);
+    }
+
+    /** 取出选择器值：数组取首项，js 对象取 rule 字段，其余按字符串处理 */
+    private String firstSelector(Object v) {
+        if (v == null) return null;
+        if (v instanceof JSONArray array && !array.isEmpty()) return array.getStr(0);
+        if (v instanceof JSONObject o) {
+            Object rule = o.get("rule");
+            return rule == null ? null : String.valueOf(rule);
+        }
+        return String.valueOf(v);
+    }
+
+    private String toSelector(String sourceRule) {
+        if (StrUtil.isBlank(sourceRule)) return "";
+
+        String[] alternatives = sourceRule.split("\\|\\|");
+        List<String> converted = new ArrayList<>();
+        for (String alt : alternatives) {
+            String sel = convertSingleSelector(alt.trim());
+            if (StrUtil.isNotBlank(sel)) converted.add(sel);
+        }
+        if (converted.isEmpty()) return "";
+        return String.join(", ", converted);
+    }
+
+    private String convertSingleSelector(String sourceRule) {
+        String rule = sourceRule;
+        if (rule.contains("<js>") || rule.contains("@js:") || rule.contains("@JSon:")) return "";
+        rule = StrUtil.subBefore(rule, "##", false).trim();
+        if (rule.regionMatches(true, 0, "@css:", 0, 5)) rule = rule.substring(5).trim();
+
+        String attribute = "";
+        Matcher attrMatcher = Pattern.compile("@(textNodes|text|html|href|src|content|value)$").matcher(rule);
+        if (attrMatcher.find()) {
+            attribute = switch (attrMatcher.group(1)) {
+                case "href", "src", "content", "value" -> "@" + attrMatcher.group(1);
+                default -> "";
+            };
+            rule = rule.substring(0, attrMatcher.start());
+        }
+
+        // legado 简写 text.标签@href：按元素文本精确定位
+        if (rule.startsWith("text.")) {
+            if (rule.equalsIgnoreCase("text.name") || rule.equalsIgnoreCase("text.author")) return "";
+            String label = rule.substring(5).trim();
+            if (label.isEmpty()) return "";
+            String escaped = label.replace("'", "''");
+            return "//a[contains(normalize-space(.),'" + escaped + "')]" + attribute;
+        }
+
+        // 已是 XPath：原样保留，不再按 @ 切分（避免破坏 [@attr] 语法）
+        if (rule.startsWith("/") || rule.startsWith("(")) {
+            return rule.trim() + attribute;
+        }
+
+        String[] parts = rule.split("@");
+        List<String> selectors = new ArrayList<>();
+        for (String part : parts) {
+            String selector = part.trim().replaceAll("^tag\\.", "");
+            selector = selector.replaceAll("^class\\.", ".").replaceAll("^id\\.", "#");
+            Matcher excludedIndex = Pattern.compile("!(\\d+)$").matcher(selector);
+            if (excludedIndex.find()) {
+                int excluded = Integer.parseInt(excludedIndex.group(1));
+                selector = selector.substring(0, excludedIndex.start())
+                        + ":not(:nth-child(" + (excluded + 1) + "))";
+            }
+            Matcher index = Pattern.compile("^([a-zA-Z][\\w-]*)\\.(\\d+)$").matcher(selector);
+            if (index.matches()) selector = index.group(1) + ":nth-of-type(" + (Integer.parseInt(index.group(2)) + 1) + ")";
+            Matcher negIndex = Pattern.compile("^([a-zA-Z][\\w-]*)\\.(-\\d+)$").matcher(selector);
+            if (negIndex.matches()) selector = negIndex.group(1) + ":nth-last-of-type(" + Math.abs(Integer.parseInt(negIndex.group(2))) + ")";
+            if (!selector.isEmpty()) selectors.add(selector);
+        }
+        return String.join(" ", selectors) + attribute;
+    }
+
+    private String getBaseUrl(String sourceUrl) {
+        if (StrUtil.isBlank(sourceUrl)) return "";
+        for (String line : sourceUrl.split("[\\r\\n]")) {
+            String url = line.trim();
+            int idx = url.indexOf("##");
+            if (idx > 0) url = url.substring(0, idx);
+            idx = url.indexOf(",");
+            if (idx > 0) url = url.substring(0, idx);
+            url = url.trim().split("#", 2)[0].trim();
+            if (url.startsWith("http://") || url.startsWith("https://")) return url;
+        }
+        return "";
+    }
+
+    private record ShareFile(String name, List<Rule> sources) {}
+
+    private record ParsedRequest(String url, String method, String data, String charset) {}
+
+    /** 每条额外书源的读取进度事件（start=true 表示开始读取，start=false 表示最终结果） */
+    public record ProgressEvent(int index, int total, String fileName, String sourceName, boolean start, boolean ok, String message) {}
+
+    private static final int SOURCE_READ_TIMEOUT_SECONDS = 10;
+
+    /**
+     * 增量读取额外书源：逐条读取、实时上报进度、逐条打日志、出错跳过、单条超时保护。
+     * 返回与 {@link #listSourcesGrouped()} 一致的分组结构，供前端直接替换展示。
+     */
+    public List<Map<String, Object>> reloadGrouped(Consumer<ProgressEvent> onProgress) {
+        // 重读到磁盘最新文件后，失效旧缓存，避免后续搜索继续用旧的解析结果
+        cachedFiles = null;
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<File> files = discoverShareFiles();
+            // 1) 先统计每个文件的条目数，算出总数用于进度条
+            List<JSONArray> fileItems = new ArrayList<>();
+            int total = 0;
+            for (File file : files) {
+                JSONArray items = readJsonItems(file);
+                fileItems.add(items);
+                total += items.size();
+            }
+            if (total == 0) {
+                Console.log("额外书源为空，未发现可读取条目");
+                return List.of();
+            }
+
+            // 2) 逐文件、逐条读取
+            AtomicInteger running = new AtomicInteger(0);
+            List<Map<String, Object>> grouped = new ArrayList<>();
+            for (int fi = 0; fi < files.size(); fi++) {
+                File file = files.get(fi);
+                JSONArray items = fileItems.get(fi);
+                if (items.isEmpty()) continue;
+
+                List<Map<String, Object>> sources = new ArrayList<>();
+                for (int i = 0; i < items.size(); i++) {
+                    int index = running.incrementAndGet();
+                    Object value = items.get(i);
+                    String rawName = (value instanceof JSONObject jo) ? StrUtil.blankToDefault(jo.getStr("bookSourceName"), "(未知名称)") : "(未知名称)";
+                    String fileName = file.getName();
+
+                    onProgress.accept(new ProgressEvent(index, total, fileName, rawName, true, true, "开始读取"));
+                    Console.log("开始读取额外书源 [{}/{}] {} <- {}", index, total, fileName, rawName);
+
+                    if (!(value instanceof JSONObject item)) {
+                        onProgress.accept(new ProgressEvent(index, total, fileName, rawName, false, false, "条目格式无效"));
+                        Console.error("跳过额外书源 [{}/{}] {}：条目格式无效", index, total, fileName);
+                        continue;
+                    }
+
+                    Rule rule;
+                    long start = System.currentTimeMillis();
+                    try {
+                        Rule r = withTimeout(executor, () -> toRule(item));
+                        rule = (r != null) ? r : buildSkeletonFallback(item);
+                    } catch (Exception e) {
+                        String reason = e.getClass().getSimpleName() + "：" + StrUtil.emptyToDefault(e.getMessage(), "未知原因");
+                        String msg = "解析超时或异常，已跳过（" + reason + "）";
+                        onProgress.accept(new ProgressEvent(index, total, fileName, rawName, false, false, msg));
+                        Console.error("跳过额外书源 [{}/{}] {} ({} ms)：{}", index, total, fileName, System.currentTimeMillis() - start, msg);
+                        continue;
+                    }
+
+                    Map<String, Object> itemMap = buildSourceItem(fileName, i, rule);
+                    sources.add(itemMap);
+                    long cost = System.currentTimeMillis() - start;
+                    String state = rule.isDisabled() ? "（解析完成，但不可用）" : "";
+                    Console.log("完成读取额外书源 [{}/{}] {} -> {}{} ({} ms)", index, total, fileName, rule.getName(), state, cost);
+                    onProgress.accept(new ProgressEvent(index, total, fileName, rule.getName(), false, true, "已读取" + state));
+                }
+                if (!sources.isEmpty()) {
+                    Map<String, Object> group = new LinkedHashMap<>();
+                    group.put("file", file.getName());
+                    group.put("sources", sources);
+                    grouped.add(group);
+                }
+            }
+            return grouped;
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    private List<File> discoverShareFiles() {
+        File directory = resolveRulesDirectory();
+        if (directory == null) return List.of();
+        return FileUtil.loopFiles(directory, file -> SHARE_FILE.matcher(file.getName()).matches())
+                .stream()
+                .sorted(Comparator.comparing(File::getName))
+                .toList();
+    }
+
+    /**
+     * 读取单个书源文件的 JSONArray；整文件无法解析时退化为按 name/url 提取，保证不丢条目。
+     */
+    private JSONArray readJsonItems(File file) {
+        try {
+            return JSONUtil.readJSONArray(file, CharsetUtil.CHARSET_UTF_8);
+        } catch (Exception e) {
+            return parseLenient(file);
+        }
+    }
+
+    private Rule withTimeout(ExecutorService executor, Callable<Rule> task) throws Exception {
+        Future<Rule> future = executor.submit(task);
+        try {
+            return future.get(SOURCE_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw e;
+        }
+    }
+
+}

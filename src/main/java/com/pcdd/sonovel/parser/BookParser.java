@@ -1,32 +1,21 @@
 package com.pcdd.sonovel.parser;
 
 import cn.hutool.core.lang.Assert;
-import cn.hutool.core.lang.Console;
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.http.HttpUtil;
-import com.pcdd.sonovel.context.HttpClientContext;
 import com.pcdd.sonovel.core.HtmlExtractor;
 import com.pcdd.sonovel.core.Source;
 import com.pcdd.sonovel.model.AppConfig;
 import com.pcdd.sonovel.model.Rule.Book;
 import com.pcdd.sonovel.utils.ChineseConverter;
 import com.pcdd.sonovel.utils.CoverUpdater;
-import com.pcdd.sonovel.utils.CrawlUtils;
 import lombok.SneakyThrows;
-import okhttp3.OkHttpClient;
-import okhttp3.Response;
-import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
-
-import java.io.InputStream;
 
 /**
  * @author pcdd
  * Created at 2024/3/17
  */
 public class BookParser extends Source {
-
-    private final OkHttpClient httpClient = HttpClientContext.get();
 
     public BookParser(AppConfig config) {
         super(config);
@@ -36,7 +25,7 @@ public class BookParser extends Source {
     public Book parse(String url) {
         Book r = this.rule.getBook();
         Document document = fetchDocument(url, r.getTimeout(), r.getBaseUri());
-        document = handleCloudflareBypass(document, url);
+        document = handleCloudflareBypass(document, url, "详情页");
 
         String bookName = HtmlExtractor.extract(document, r.getBookName());
         String author = HtmlExtractor.extract(document, r.getAuthor());
@@ -58,24 +47,6 @@ public class BookParser extends Source {
         book.setStatus(HtmlExtractor.extract(document, r.getStatus()));
 
         return ChineseConverter.convert(book, this.rule.getLanguage(), config.getLanguage());
-    }
-
-    @SneakyThrows
-    private Document fetchDocument(String url, int timeout, String baseUri) {
-        try (Response resp = CrawlUtils.request(httpClient, url, timeout);
-             InputStream is = resp.body().byteStream()) {
-            return Jsoup.parse(is, null, baseUri);
-        }
-    }
-
-    private Document handleCloudflareBypass(Document document, String url) {
-        if (CrawlUtils.hasCf(document)) {
-            Assert.isTrue(StrUtil.isNotEmpty(config.getCfBypass()), "🤖 检测到详情页 {} 存在 Cloudflare 真人验证，但未设置 cf-bypass 配置项，故跳过", url);
-            Console.log("🤖 检测到详情页 {} 存在 Cloudflare 真人验证，正在尝试绕过...", url);
-            String realHtml = HttpUtil.get("%s/html?url=%s".formatted(this.config.getCfBypass(), url));
-            document = Jsoup.parse(realHtml);
-        }
-        return document;
     }
 
 }

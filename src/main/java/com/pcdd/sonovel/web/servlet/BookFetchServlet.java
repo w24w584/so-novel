@@ -24,6 +24,10 @@ public class BookFetchServlet extends HttpServlet {
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) {
         try {
             String bookUrl = req.getParameter("url");
+            if (StrUtil.isBlank(bookUrl)) {
+                RespUtils.writeError(resp, 400, "书籍详情链接为空，请重新搜索；若仍出现，请检查对应书源的搜索书名规则是否选中了带链接的元素");
+                return;
+            }
             String format = req.getParameter("format");
             String language = req.getParameter("language");
             String concurrencyStr = req.getParameter("concurrency");

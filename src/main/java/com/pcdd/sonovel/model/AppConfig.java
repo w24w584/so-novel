@@ -10,6 +10,7 @@ import lombok.Data;
 public class AppConfig {
 
     private String version;
+    private String buildTime;
 
     // [global]
     private Integer autoUpdate;

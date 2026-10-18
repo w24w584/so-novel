@@ -62,7 +62,8 @@ public class SourceUtils {
         Rule rule = getActivatedRules().stream()
                 .filter(r -> bookUrl.startsWith(r.getUrl()))
                 .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException(StrUtil.format("{} 找不到 bookUrl 为 {} 的规则！", APP_CONFIG.getActiveRules(), bookUrl)));
+                .orElseGet(() -> ShareBookSourceLoader.findByUrl(bookUrl, getActivatedRules().size()));
+        Assert.notNull(rule, "{} 找不到 bookUrl 为 {} 的规则！", APP_CONFIG.getActiveRules(), bookUrl);
         return applyDefaultRule(rule);
     }
 
@@ -73,7 +74,8 @@ public class SourceUtils {
         Rule rule = getActivatedRules().stream()
                 .filter(r -> r.getId() == sourceId)
                 .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException(StrUtil.format("{} 找不到 ID 为 {} 的规则！", APP_CONFIG.getActiveRules(), sourceId)));
+                .orElseGet(() -> ShareBookSourceLoader.findById(sourceId, getActivatedRules().size()));
+        Assert.notNull(rule, "{} 找不到 ID 为 {} 的规则！", APP_CONFIG.getActiveRules(), sourceId);
         return applyDefaultRule(rule);
     }
 
@@ -183,7 +185,34 @@ public class SourceUtils {
      * 获取可聚合搜索的书源列表。排除不支持搜索的、搜索有限流的、搜索意义不大的、暂时无法访问的书源
      */
     public List<Source> getSearchableSources() {
-        return getActivatedRules().stream()
+        return getSearchableSources(java.util.Set.of());
+    }
+
+    public List<Source> getSearchableSources(java.util.Set<String> sourceIds) {
+        // 未显式传入 main 选择时，默认全部内置书源参与（兼容旧客户端 / GET 调用）
+        return getSearchableSources(sourceIds, null);
+    }
+
+    public List<Source> getSearchableSources(java.util.Set<String> sourceIds, java.util.Set<Integer> mainSel) {
+        java.util.Set<String> shareSel = new java.util.HashSet<>();
+        if (sourceIds != null) {
+            for (String id : sourceIds) {
+                if (id == null || id.isBlank()) continue;
+                if (!id.startsWith("main#")) {
+                    shareSel.add(id);
+                }
+            }
+        }
+
+        List<Rule> rules = new ArrayList<>();
+        for (Rule r : getActivatedRules()) {
+            // 内置/激活书源整体归为一组，便于前端按来源文件上色
+            if (StrUtil.isBlank(r.getSourceGroup())) r.setSourceGroup("main");
+            // mainSel 为 null 表示默认全部参与；非 null（可为空）则严格按勾选过滤
+            if (mainSel == null || mainSel.contains(r.getId())) rules.add(r);
+        }
+        rules.addAll(ShareBookSourceLoader.loadSelected(shareSel, getActivatedRules().size()));
+        return rules.stream()
                 .filter(r -> !r.isDisabled() && r.getSearch() != null && !r.getSearch().isDisabled())
                 .map(r -> {
                     // 此处切勿改为 AppConfigLoader.APP_CONFIG
@@ -192,6 +221,22 @@ public class SourceUtils {
                     return new Source(cfg);
                 })
                 .toList();
+    }
+
+    public List<java.util.Map<String, Object>> getShareSources() {
+        // 把内置(main)书源作为第一个分组返回，与额外书源用相同的来源结构，前端可统一勾选、按标签切换
+        List<java.util.Map<String, Object>> mainSources = new ArrayList<>();
+        for (Rule r : getActivatedRules()) {
+            mainSources.add(ShareBookSourceLoader.buildSourceItem("main", r.getId(), r));
+        }
+        java.util.Map<String, Object> mainGroup = new java.util.LinkedHashMap<>();
+        mainGroup.put("file", "main");
+        mainGroup.put("sources", mainSources);
+
+        List<java.util.Map<String, Object>> groups = new ArrayList<>();
+        groups.add(mainGroup);
+        groups.addAll(ShareBookSourceLoader.listSourcesGrouped());
+        return groups;
     }
 
     @SneakyThrows

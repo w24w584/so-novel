@@ -35,11 +35,23 @@ public class HtmlExtractor {
      * 等价于 document.select(query) | document.selectXpath(query)
      */
     public Elements select(Element el, String query) {
-        // 分割查询条件以提取 XPath 或 CSS 查询
-        String selector = StrUtil.subBefore(query, "@", false);
+        if (el == null || StrUtil.isBlank(query)) return new Elements();
+        String selector = query.trim();
 
-        boolean isXPath = selector.matches("^(/|//|\\().*");
-        return isXPath ? el.selectXpath(selector) : el.select(selector);
+        // XPath：原样走 XPath，仅剥离末尾用于提取内容的属性后缀，保留内部 [@attr] 语法
+        boolean isXPath = selector.startsWith("/") || selector.startsWith("(");
+        if (isXPath) {
+            selector = selector.replaceAll("@(textNodes|text|html|href|src|content|value)\\s*$", "");
+            while (selector.endsWith("/") && selector.length() > 1) {
+                selector = selector.substring(0, selector.length() - 1);
+            }
+            if (selector.isEmpty()) return new Elements();
+            return el.selectXpath(selector);
+        }
+
+        // CSS：以 @ 分隔符提取选择器与属性后缀
+        selector = StrUtil.subBefore(selector, "@", false);
+        return el.select(selector);
     }
 
     public String extract(Element el, String query) {
@@ -59,9 +71,7 @@ public class HtmlExtractor {
             return null;
         }
 
-        String cleanQuery = stripQuery(query);
-
-        Elements elements = select(el, cleanQuery);
+        Elements elements = select(el, query);
         if (elements.isEmpty()) return "";
 
 
@@ -114,21 +124,15 @@ public class HtmlExtractor {
             return switch (type) {
                 case TEXT -> els.text();
                 case HTML -> els.html();
-                case ATTR_SRC, ATTR_HREF, ATTR_CONTENT, ATTR_VALUE -> els.attr(type.getValue());
+                // 与单元素分支保持一致：多个匹配时也需返回绝对地址，
+                // 否则 Elements.attr 只会给出相对地址，导致分页链接被 Validator.isUrl 判为非法而中断翻页
+                case ATTR_SRC, ATTR_HREF -> els.isEmpty() ? "" : els.first().absUrl(type.getValue());
+                // 切勿改为 absUrl
+                case ATTR_CONTENT, ATTR_VALUE -> els.attr(type.getValue());
             };
         }
 
         return "";
-    }
-
-    /**
-     * 去除 selector 中的属性语法（@href / @src），仅保留 CSS/XPath 选择器
-     */
-    private static String stripQuery(String query) {
-        if (query == null) return null;
-
-        int atIndex = query.indexOf('@');
-        return atIndex > 0 ? query.substring(0, atIndex) : query;
     }
 
 }

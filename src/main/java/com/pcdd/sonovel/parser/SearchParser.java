@@ -2,15 +2,14 @@ package com.pcdd.sonovel.parser;
 
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.collection.ListUtil;
-import cn.hutool.core.lang.Assert;
 import cn.hutool.core.lang.Console;
 import cn.hutool.core.lang.ConsoleTable;
 import cn.hutool.core.util.ArrayUtil;
 import cn.hutool.core.util.ReUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.core.util.URLUtil;
+import cn.hutool.json.JSONUtil;
 import cn.hutool.http.Header;
-import cn.hutool.http.HttpUtil;
 import com.pcdd.sonovel.context.HttpClientContext;
 import com.pcdd.sonovel.core.HtmlExtractor;
 import com.pcdd.sonovel.core.Source;
@@ -32,7 +31,12 @@ import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
 import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.fusesource.jansi.AnsiRenderer.render;
 
@@ -66,10 +70,18 @@ public class SearchParser extends Source {
         try {
             String searchUrl = processUrl(r.getUrl(), keyword);
             URI uri = URI.create(searchUrl);
+            if (!uri.isAbsolute()) {
+                uri = URI.create(this.rule.getUrl()).resolve(uri);
+                searchUrl = uri.toString();
+            }
             String referer = uri.getScheme() + "://" + uri.getAuthority();
             Request.Builder builder = new Request.Builder()
                     .addHeader(Header.REFERER.toString(), referer)
                     .url(searchUrl);
+
+            if (r.getHeaders() != null) {
+                r.getHeaders().forEach(builder::addHeader);
+            }
 
             if (StrUtil.isNotBlank(r.getCookies())) {
                 builder.addHeader("Cookie", r.getCookies());
@@ -79,16 +91,11 @@ public class SearchParser extends Source {
             }
 
             try (Response resp = CrawlUtils.request(httpClient, builder, r.getTimeout())) {
-                String body = processResultWithJs(resp.peekBody(Long.MAX_VALUE).string(), r.getResult());
+                String body = processResultWithJs(decodeBody(resp, r.getCharset()), r.getResult());
                 document = Jsoup.parse(body, r.getBaseUri());
             }
 
-            if (CrawlUtils.hasCf(document)) {
-                Assert.isTrue(StrUtil.isNotEmpty(config.getCfBypass()), "🤖 检测到搜索页 {} 存在 Cloudflare 真人验证，但未设置 cf-bypass 配置项，故跳过", searchUrl);
-                Console.log("🤖 检测到搜索页 {} 存在 Cloudflare 真人验证，正在尝试绕过...", searchUrl);
-                String html = HttpUtil.get("%s/html?url=%s".formatted(this.config.getCfBypass(), searchUrl));
-                document = Jsoup.parse(html);
-            }
+            document = handleCloudflareBypass(document, searchUrl, "搜索页");
 
         } catch (Exception e) {
             Console.error(render("<== 书源 {} ({}) 搜索解析出错: {}", "red"),
@@ -141,7 +148,9 @@ public class SearchParser extends Source {
             Elements resultEls = HtmlExtractor.select(document, resultSelector);
 
             // 部分书源完全匹配时会直接跳转到详情页（搜索结果为空 && 书名不为空），故需要构造搜索结果
-            if (resultEls.isEmpty() && !HtmlExtractor.select(document, this.rule.getBook().getBookName()).isEmpty()) {
+            if (resultEls.isEmpty() && this.rule.getBook() != null
+                    && StrUtil.isNotBlank(this.rule.getBook().getBookName())
+                    && !HtmlExtractor.select(document, this.rule.getBook().getBookName()).isEmpty()) {
                 String bookUrl = document.location();
                 BookParser bookParser = new BookParser(config);
                 Book book = bookParser.parse(bookUrl);
@@ -153,6 +162,7 @@ public class SearchParser extends Source {
                 SearchResult sr = SearchResult.builder()
                         .sourceId(this.rule.getId())
                         .sourceName(this.rule.getName())
+                        .sourceGroup(this.rule.getSourceGroup())
                         .url(bookUrl)
                         .bookName(book.getBookName())
                         .author(book.getAuthor())
@@ -171,13 +181,19 @@ public class SearchParser extends Source {
 
             for (Element el : limitResultEls) {
                 // jsoup 不支持一次性获取属性的值
-                String href = HtmlExtractor.extract(el, r.getBookName(), ContentType.ATTR_HREF);
+                String href = extractBookUrl(el, r);
                 String bookName = HtmlExtractor.extract(el, r.getBookName());
                 if (bookName.isEmpty()) continue;
+                if (StrUtil.isBlank(href)) {
+                    Console.error("<== 书源 {} ({}) 搜索结果“{}”没有提取到书籍详情链接，已跳过",
+                            this.rule.getId(), this.rule.getName(), bookName);
+                    continue;
+                }
 
                 SearchResult sr = SearchResult.builder()
                         .sourceId(this.rule.getId())
                         .sourceName(this.rule.getName())
+                        .sourceGroup(this.rule.getSourceGroup())
                         .url(href)
                         .bookName(bookName)
                         // 以下为非必须属性
@@ -267,11 +283,121 @@ public class SearchParser extends Source {
     }
 
     // 若 url 含 @js:，则 JS 接收 keyword 返回完整 URL；否则直接格式化
-    private static String processUrl(String url, String keyword) {
+    private String processUrl(String url, String keyword) {
         if (url != null && url.contains("@js:")) {
-            return JsCaller.call(StrUtil.subAfter(url, "@js:", false), keyword);
+            String jsCode = StrUtil.subAfter(url, "@js:", false);
+            return executeShareSearchJs(jsCode, keyword);
         }
-        return url.formatted(keyword);
+        String searchTerm = this.rule.isShareSource()
+                ? URLEncoder.encode(keyword, StandardCharsets.UTF_8).replace("+", "%20")
+                : keyword;
+        return url.replace("%s", searchTerm);
+    }
+
+    /**
+     * 解码搜索响应体：优先按页面/响应头声明的字符集解码（浏览器行为），缺失时回退书源声明的 charset，最后才 UTF-8。
+     * 避免站点与书源标注不一致时（如书源标 gbk、页面实为 UTF-8）出现乱码。
+     */
+    @SneakyThrows
+    private String decodeBody(Response resp, String charset) {
+        byte[] bytes = resp.peekBody(Long.MAX_VALUE).bytes();
+        // 1. 页面 <meta> 声明的 charset 最可靠
+        Charset meta = detectMetaCharset(bytes);
+        if (meta != null) return new String(bytes, meta);
+        // 2. 响应头 Content-Type 声明的 charset
+        okhttp3.MediaType mt = resp.body() == null ? null : resp.body().contentType();
+        if (mt != null && mt.charset() != null) return new String(bytes, mt.charset());
+        // 3. 书源声明的 charset
+        if (charset != null && Charset.isSupported(charset)) return new String(bytes, Charset.forName(charset));
+        // 4. 兜底 UTF-8
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 从响应体前几个字节中探测 <meta> 声明的字符集。
+     */
+    private Charset detectMetaCharset(byte[] bytes) {
+        String head = new String(bytes, 0, Math.min(bytes.length, 8192), StandardCharsets.ISO_8859_1);
+        Matcher m = Pattern.compile("(?i)<meta[^>]*charset\\s*=\\s*[\"']?\\s*([A-Za-z0-9_\\-]+)",
+                Pattern.DOTALL).matcher(head);
+        if (m.find()) {
+            try {
+                return Charset.forName(m.group(1));
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 从单个搜索结果元素中提取详情链接。
+     * 兼容两种常见结构：书名元素自身带 href（如 p.bookname > a 的 h3/a），以及书名元素为普通元素、链接在子级 a 上
+     * （如 <p class="bookname"><a href>书名</a></p>，此时对 p 取 href 拿不到）。
+     */
+    private String extractBookUrl(Element el, Rule.Search r) {
+        String q = r.getBookName();
+        String href = HtmlExtractor.extract(el, q, ContentType.ATTR_HREF);
+        if (StrUtil.isNotBlank(href)) return href;
+
+        // 优先在书名元素内部找链接；书名元素未命中时再在整个结果项(el=li)里找
+        String nameSel = q;
+        int at = q.indexOf('@');
+        if (at > 0) nameSel = q.substring(0, at);
+        Element link = null;
+        try {
+            Element nameEl = el.selectFirst(nameSel);
+            if (nameEl != null) link = nameEl.selectFirst("a[href]");
+        } catch (Exception ignored) {
+        }
+        if (link == null) link = el.selectFirst("a[href]");
+        return link == null ? "" : link.absUrl("href");
+    }
+
+    @SneakyThrows
+    private String executeShareSearchJs(String jsCode, String keyword) {
+        String sourceUrl = this.rule.getUrl();
+        String sourceKey = sourceUrl;
+        String wrappedJs = """
+                var url_result = null;
+                var key = %s;
+                var page = 1;
+                var source = {
+                    bookSourceUrl: %s,
+                    key: %s,
+                    getKey: function() { return %s; }
+                };
+                var java = {
+                    _store: {},
+                    put: function(k, v) { this._store[k] = v; },
+                    get: function(k) { return this._store[k]; },
+                    log: function() {}
+                };
+                var cookie = {
+                    removeCookie: function() {},
+                    getCookie: function() { return ''; }
+                };
+                var result = (function() {
+                    %s
+                })();
+                if (java._store.url) {
+                    url_result = java._store.url;
+                } else if (result) {
+                    url_result = result;
+                }
+                return url_result;
+                """.formatted(
+                JSONUtil.toJsonStr(keyword),
+                JSONUtil.toJsonStr(sourceUrl),
+                JSONUtil.toJsonStr(sourceKey),
+                JSONUtil.toJsonStr(sourceKey),
+                jsCode);
+        try {
+            return JsCaller.eval(wrappedJs);
+        } catch (Exception e) {
+            Console.error("<== 书源 {} ({}) searchUrl @js: 执行失败: {}",
+                    this.rule.getId(), this.rule.getName(), e.getMessage());
+            return null;
+        }
     }
 
     // 若 result 含 @js:，则 JS 接收响应体并返回转换后的 HTML
