@@ -277,6 +277,7 @@ public class ShareBookSourceLoader {
 
         searchRule.setHeaders(readHeaders(item.getStr("header")));
         searchRule.setResult(toSelector(search.getStr("bookList")));
+        searchRule.setBookUrl(toSelector(search.getStr("bookUrl")));
         searchRule.setBookName(toSelector(search.getStr("name")));
         searchRule.setAuthor(toSelector(search.getStr("author")));
         searchRule.setCategory(toSelector(search.getStr("kind")));
@@ -306,15 +307,21 @@ public class ShareBookSourceLoader {
 
         JSONObject toc = item.getJSONObject("ruleToc");
         String chapterList = toc == null ? null : firstSelector(toc.get("chapterList"));
-        if (toc != null && StrUtil.isNotBlank(chapterList) && !chapterList.contains("<js>")) {
+        String tocJs = extractJsCode(chapterList);
+        if (toc != null && StrUtil.isNotBlank(tocJs)) {
+            // 目录规则依赖 JS：交给 LegadoJsRuntime 执行（如 JSONP 目录接口）
+            Rule.Toc tocRule = new Rule.Toc();
+            tocRule.setBaseUri(rule.getUrl());
+            tocRule.setJsList(tocJs);
+            tocRule.setDesc(false);
+            rule.setToc(tocRule);
+        } else if (toc != null && StrUtil.isNotBlank(chapterList) && !chapterList.contains("<js>")) {
             Rule.Toc tocRule = new Rule.Toc();
             tocRule.setBaseUri(rule.getUrl());
             tocRule.setItem(toSelector(chapterList));
             tocRule.setNextPageUrl(toSelector(resolvePagingSelector(toc)));
             tocRule.setDesc(false);
             rule.setToc(tocRule);
-        } else if (toc != null && StrUtil.isNotBlank(chapterList) && chapterList.contains("<js>")) {
-            noDownloadReasons.add("目录规则含 JS");
         } else {
             noDownloadReasons.add("缺少目录规则");
         }
@@ -497,6 +504,23 @@ public class ShareBookSourceLoader {
         return String.valueOf(v);
     }
 
+    /**
+     * 提取 legado JS 规则的源码，兼容 {@code <js>code</js>}、{@code @js:code}、{@code <js>@js:code</js>} 等写法。
+     * 非 JS 规则返回 null。
+     */
+    private String extractJsCode(String rule) {
+        if (StrUtil.isBlank(rule)) return null;
+        String code = rule;
+        int start = code.indexOf("<js>");
+        if (start >= 0) {
+            int end = code.indexOf("</js>", start);
+            code = end > start ? code.substring(start + 4, end) : code.substring(start + 4);
+        }
+        code = code.trim();
+        if (code.regionMatches(true, 0, "@js:", 0, 4)) code = code.substring(4).trim();
+        return code.isEmpty() ? null : code;
+    }
+
     private String toSelector(String sourceRule) {
         if (StrUtil.isBlank(sourceRule)) return "";
 
@@ -513,7 +537,13 @@ public class ShareBookSourceLoader {
     private String convertSingleSelector(String sourceRule) {
         String rule = sourceRule;
         if (rule.contains("<js>") || rule.contains("@js:") || rule.contains("@JSon:")) return "";
-        rule = StrUtil.subBefore(rule, "##", false).trim();
+        // legado 的 ##正则##替换 属于取值后的后处理，交由 HtmlExtractor 应用
+        String postProcess = "";
+        int hashIndex = rule.indexOf("##");
+        if (hashIndex >= 0) {
+            postProcess = rule.substring(hashIndex).trim();
+            rule = rule.substring(0, hashIndex).trim();
+        }
         if (rule.regionMatches(true, 0, "@css:", 0, 5)) rule = rule.substring(5).trim();
 
         String attribute = "";
@@ -532,12 +562,12 @@ public class ShareBookSourceLoader {
             String label = rule.substring(5).trim();
             if (label.isEmpty()) return "";
             String escaped = label.replace("'", "''");
-            return "//a[contains(normalize-space(.),'" + escaped + "')]" + attribute;
+            return "//a[contains(normalize-space(.),'" + escaped + "')]" + attribute + postProcess;
         }
 
         // 已是 XPath：原样保留，不再按 @ 切分（避免破坏 [@attr] 语法）
         if (rule.startsWith("/") || rule.startsWith("(")) {
-            return rule.trim() + attribute;
+            return rule.trim() + attribute + postProcess;
         }
 
         String[] parts = rule.split("@");
@@ -557,7 +587,7 @@ public class ShareBookSourceLoader {
             if (negIndex.matches()) selector = negIndex.group(1) + ":nth-last-of-type(" + Math.abs(Integer.parseInt(negIndex.group(2))) + ")";
             if (!selector.isEmpty()) selectors.add(selector);
         }
-        return String.join(" ", selectors) + attribute;
+        return String.join(" ", selectors) + attribute + postProcess;
     }
 
     private String getBaseUrl(String sourceUrl) {

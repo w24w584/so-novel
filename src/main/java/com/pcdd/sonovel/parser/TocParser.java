@@ -4,10 +4,12 @@ import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.lang.Console;
 import cn.hutool.core.lang.Validator;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.http.HtmlUtil;
 import com.pcdd.sonovel.core.HtmlExtractor;
 import com.pcdd.sonovel.core.Source;
 import com.pcdd.sonovel.model.*;
 import com.pcdd.sonovel.utils.CrawlUtils;
+import com.pcdd.sonovel.utils.LegadoJsRuntime;
 import com.pcdd.sonovel.utils.VirtualThreadLimiter;
 import lombok.SneakyThrows;
 import org.jsoup.Jsoup;
@@ -96,13 +98,16 @@ public class TocParser extends Source {
 
         Set<String> urls = CollUtil.newLinkedHashSet(url);
 
-        if (StrUtil.isNotBlank(pageSelector(ruleToc))) {
-            Document document = fetchDocument(url, timeout, ruleToc.getBaseUri());
-            document = handleCloudflareBypass(document, url, "目录页");
-            extractPaginationUrls(urls, document, ruleToc);
-        } else {
-            // 规则未配置分页时，自动跟随“下一页/下页/尾页”链接补充分页（兼容分享书源 nextTocUrl 为空的情况）
-            collectGenericPagination(urls, url, ruleToc);
+        if (StrUtil.isBlank(ruleToc.getJsList())) {
+            // JS 目录规则会自行处理翻页（如 JSONP 接口一次返回全部章节），故跳过下面两种分页补充
+            if (StrUtil.isNotBlank(pageSelector(ruleToc))) {
+                Document document = fetchDocument(url, timeout, ruleToc.getBaseUri());
+                document = handleCloudflareBypass(document, url, "目录页");
+                extractPaginationUrls(urls, document, ruleToc);
+            } else {
+                // 规则未配置分页时，自动跟随“下一页/下页/尾页”链接补充分页（兼容分享书源 nextTocUrl 为空的情况）
+                collectGenericPagination(urls, url, ruleToc);
+            }
         }
 
         List<Chapter> toc = parseToc(urls, start, end, ruleToc);
@@ -252,7 +257,11 @@ public class TocParser extends Source {
         }
     }
 
-    private List<Element> extractElements(Document document, Rule.Toc r) {
+    private List<Element> extractElements(Document document, Rule.Toc r, String pageUrl) {
+        // 目录规则依赖 JS（legado <js>/@js:）时，由 JS 运行时产出章节项
+        if (StrUtil.isNotBlank(r.getJsList())) {
+            return extractJsElements(document, r, pageUrl);
+        }
         // 处理 ul
         if (StrUtil.isNotEmpty(r.getList())) {
             String tocHtml = HtmlExtractor.extract(document, r.getList(), ContentType.HTML);
@@ -261,6 +270,29 @@ public class TocParser extends Source {
         }
         // 处理 ul > li > a
         return HtmlExtractor.select(document, r.getItem());
+    }
+
+    /**
+     * 执行分享书源的目录 JS 规则（如 JSONP 目录接口），把返回的元素片段解析为章节项。
+     */
+    private List<Element> extractJsElements(Document document, Rule.Toc r, String pageUrl) {
+        String base = StrUtil.emptyToDefault(pageUrl, r.getBaseUri());
+        List<LegadoJsRuntime.TocItem> items = LegadoJsRuntime.evalChapterList(
+                r.getJsList(), document.html(), base, r.getBaseUri(), r.getTimeout());
+
+        List<Element> elements = new ArrayList<>();
+        for (LegadoJsRuntime.TocItem item : items) {
+            // 元素片段直接解析；仅给出 text/href 时构造等价链接，复用统一的章节提取逻辑
+            String html = StrUtil.isNotBlank(item.html())
+                    ? item.html()
+                    : "<a href=\"" + HtmlUtil.escape(item.href()) + "\">" + HtmlUtil.escape(item.text()) + "</a>";
+            Document fragment = Jsoup.parseBodyFragment(html, base);
+            elements.addAll(fragment.body().children());
+        }
+        if (elements.isEmpty()) {
+            Console.error("<== 目录 JS 规则未返回章节项（源: {}）", r.getBaseUri());
+        }
+        return elements;
     }
 
     private List<Chapter> parseToc(Set<String> urls, int start, int end, Rule.Toc r) {
@@ -275,7 +307,7 @@ public class TocParser extends Source {
                     try {
                         Document doc = fetchDocument(pageUrl, r.getTimeout(), r.getBaseUri());
                         doc = handleCloudflareBypass(doc, pageUrl, "目录页");
-                        List<Element> els = extractElements(doc, r);
+                        List<Element> els = extractElements(doc, r, pageUrl);
                         if (els.isEmpty()) {
                             els = harvestChapterLinks(doc);
                             if (!els.isEmpty()) {

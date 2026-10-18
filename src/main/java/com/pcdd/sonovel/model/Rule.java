@@ -44,6 +44,8 @@ public class Rule {
         private String cookies;
         private java.util.Map<String, String> headers;
         private String result;
+        /** legado 的 bookUrl 规则（详情页链接），为空时回退到书名元素上的 href */
+        private String bookUrl;
         private String bookName;
         private String author;
         private String category;
@@ -78,6 +80,8 @@ public class Rule {
         private String url;
         private String list;
         private String item;
+        /** legado 分享书源中依赖 JS 的目录规则（{@code <js>}/{@code @js:}）源码，非空时由 LegadoJsRuntime 执行得到章节项 */
+        private String jsList;
         private boolean isDesc;
         private String nextPage;
         private String nextPageUrl;

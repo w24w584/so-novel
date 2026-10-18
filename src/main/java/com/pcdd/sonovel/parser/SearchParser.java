@@ -351,6 +351,13 @@ public class SearchParser extends Source {
      * （如 <p class="bookname"><a href>书名</a></p>，此时对 p 取 href 拿不到）。
      */
     private String extractBookUrl(Element el, Rule.Search r) {
+        // 优先使用书源自带的 bookUrl 规则（legado 语义，可能带 ##正则##替换 等后处理）
+        if (StrUtil.isNotBlank(r.getBookUrl())) {
+            String url = HtmlExtractor.extract(el, r.getBookUrl(), ContentType.ATTR_HREF);
+            // 只有提取到可用的绝对地址才采用，否则回退到书名元素上的链接
+            if (StrUtil.startWithAny(url, "http://", "https://")) return url;
+        }
+
         String q = r.getBookName();
         String href = HtmlExtractor.extract(el, q, ContentType.ATTR_HREF);
         if (StrUtil.isNotBlank(href)) return href;
