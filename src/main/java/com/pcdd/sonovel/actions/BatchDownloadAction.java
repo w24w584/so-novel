@@ -93,7 +93,7 @@ public class BatchDownloadAction {
                 String logTemplate = StrUtil.format(DIVIDER + " %s 《{}》({}) 进度: {}/{} " + DIVIDER,
                         sr.getBookName(), sr.getAuthor(), i + 1, downloadList.size());
                 Console.log("\n" + logTemplate.formatted("START"));
-                totalTime += new Crawler(config).crawl(sr.getUrl());
+                totalTime += new Crawler(config).crawl(sr.getUrl(), sr.getBookName(), sr.getAuthor());
                 Console.log(logTemplate.formatted("END") + "\n");
             }
 

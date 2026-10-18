@@ -64,6 +64,9 @@ public class BookFetchServlet extends HttpServlet {
             SearchResult sr = SearchResult.builder()
                     .sourceId(id)
                     .url(bookUrl)
+                    // 分享书源的详情页书名规则可能缺失，带上搜索结果中的书名/作者兜底
+                    .bookName(req.getParameter("bookName"))
+                    .author(req.getParameter("author"))
                     .build();
 
             double totalTimeSeconds = downloadFileToServer(sr, format, language, concurrency);
@@ -92,7 +95,7 @@ public class BookFetchServlet extends HttpServlet {
 
         Console.log("<== 正在解析章节目录...");
 
-        return new Crawler(cfg).crawl(sr.getUrl());
+        return new Crawler(cfg).crawl(sr.getUrl(), sr.getBookName(), sr.getAuthor());
     }
 
 }
