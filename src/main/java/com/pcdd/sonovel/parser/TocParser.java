@@ -51,13 +51,23 @@ public class TocParser extends Source {
     @SneakyThrows
     public List<Chapter> parse(String url, int start, int end) {
         Rule.Toc ruleToc = this.rule.getToc();
+        if (ruleToc == null) {
+            Console.error("<== 书源 {} 缺少目录规则，无法解析章节目录", this.rule.getName());
+            return new ArrayList<>();
+        }
         Rule.Book ruleBook = this.rule.getBook();
-        String bookUrlPattern = StrUtil.subBefore(ruleBook.getUrl(), "@js:", false);
+        Integer timeout = ruleBook != null ? ruleBook.getTimeout() : ruleToc.getTimeout();
+        String bookUrlPattern = ruleBook == null ? null : StrUtil.subBefore(ruleBook.getUrl(), "@js:", false);
         String id = null;
         if (StrUtil.isNotBlank(bookUrlPattern)) {
-            Matcher matcher = Pattern.compile(bookUrlPattern).matcher(url);
-            if (matcher.groupCount() > 0 && matcher.find()) {
-                id = matcher.group(1);
+            try {
+                Matcher matcher = Pattern.compile(bookUrlPattern).matcher(url);
+                if (matcher.groupCount() > 0 && matcher.find()) {
+                    id = matcher.group(1);
+                }
+            } catch (Exception e) {
+                // 分享书源会用源主页 URL 充当该书规则，含 ?/+/() 等字符时不是合法正则，忽略即可
+                Console.log("<== 书源 {} 的 URL 模板不是合法正则，跳过 id 提取: {}", this.rule.getName(), bookUrlPattern);
             }
         }
 
@@ -87,7 +97,7 @@ public class TocParser extends Source {
         Set<String> urls = CollUtil.newLinkedHashSet(url);
 
         if (StrUtil.isNotBlank(pageSelector(ruleToc))) {
-            Document document = fetchDocument(url, ruleBook.getTimeout(), ruleToc.getBaseUri());
+            Document document = fetchDocument(url, timeout, ruleToc.getBaseUri());
             document = handleCloudflareBypass(document, url, "目录页");
             extractPaginationUrls(urls, document, ruleToc);
         } else {

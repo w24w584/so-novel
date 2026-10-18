@@ -8,6 +8,7 @@ import com.pcdd.sonovel.handler.SearchResultsHandler;
 import com.pcdd.sonovel.model.Rule;
 import com.pcdd.sonovel.model.SearchResult;
 import com.pcdd.sonovel.parser.SearchParser;
+import com.pcdd.sonovel.utils.EnvUtils;
 import com.pcdd.sonovel.utils.SourceUtils;
 import com.pcdd.sonovel.utils.VirtualThreadLimiter;
 import lombok.AllArgsConstructor;
@@ -63,19 +64,28 @@ public class AggregatedSearchAction {
         List<SearchResult> results = Collections.synchronizedList(new ArrayList<>());
         List<Source> searchableSources = SourceUtils.getSearchableSources(shareSourceIds);
         CountDownLatch latch = new CountDownLatch(searchableSources.size());
+        AtomicInteger failed = new AtomicInteger();
+        boolean dev = EnvUtils.isDev();
 
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             for (Source source : searchableSources) {
                 executor.execute(() -> {
                     try {
-                        List<SearchResult> res = new SearchParser(source.config).parse(kw);
+                        SearchParser parser = new SearchParser(source.config);
+                        List<SearchResult> res = parser.parse(kw);
+                        if (parser.isParseFailed()) {
+                            failed.incrementAndGet();
+                        }
                         if (CollUtil.isNotEmpty(res)) {
                             Rule rule = source.rule;
                             Console.log("<== 书源 {} ({})\t搜索到 {} 条记录", rule.getId(), rule.getName(), res.size());
                             results.addAll(res);
                         }
                     } catch (Exception e) {
-                        Console.error("搜索源 {} 异常：{}", source.rule.getName(), e.getMessage());
+                        failed.incrementAndGet();
+                        if (dev) {
+                            Console.error("搜索源 {} 异常：{}", source.rule.getName(), e.getMessage());
+                        }
                     } finally {
                         latch.countDown();
                     }
@@ -83,6 +93,7 @@ public class AggregatedSearchAction {
             }
 
             latch.await();
+            Console.log("<== 聚合搜索完成：成功 {} / 失败 {} / 共 {} 个书源", searchableSources.size() - failed.get(), failed.get(), searchableSources.size());
             return SearchResultsHandler.filterAndSort(results, kw);
         }
     }
@@ -92,12 +103,12 @@ public class AggregatedSearchAction {
      */
     @FunctionalInterface
     public interface SearchProgress {
-        void onProgress(int done, int total, int found);
+        void onProgress(int done, int total, int found, int failed);
     }
 
     /**
      * 流式聚合搜索：限制并发保证稳定性，按完成顺序通过 onPage 推送各书源结果（可并行回调，需线程安全），
-     * 并通过 onProgress 上报扫描进度（已扫描书源数 / 总数 / 已命中条数）。所有书源都会执行，不做提前终止。
+     * 并通过 onProgress 上报扫描进度（已扫描书源数 / 总数 / 已命中条数 / 失败书源数）。所有书源都会执行，不做提前终止。
      */
     @SneakyThrows
     public static List<SearchResult> streamSearch(String kw, Set<String> shareSourceIds, Set<Integer> mainSel,
@@ -110,6 +121,8 @@ public class AggregatedSearchAction {
         List<SearchResult> all = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger searched = new AtomicInteger();
         AtomicInteger found = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
+        boolean dev = EnvUtils.isDev();
         int concurrency = AppConfigLoader.APP_CONFIG.getConcurrency();
         if (concurrency <= 0) concurrency = 20;
 
@@ -118,9 +131,17 @@ public class AggregatedSearchAction {
                 limiter.submit(() -> {
                     List<SearchResult> raw = null;
                     try {
-                        raw = new SearchParser(source.config).parse(kw);
+                        SearchParser parser = new SearchParser(source.config);
+                        raw = parser.parse(kw);
+                        if (parser.isParseFailed()) {
+                            failed.incrementAndGet();
+                        }
                     } catch (Exception e) {
-                        Console.error("搜索源 {} 异常：{}", source.rule.getName(), e.getMessage());
+                        failed.incrementAndGet();
+                        // 失效站/反爬站很多，普通运行只计数，详细原因仅在开发模式打印，避免刷屏
+                        if (dev) {
+                            Console.error("搜索源 {} 异常：{}", source.rule.getName(), e.getMessage());
+                        }
                     } finally {
                         List<SearchResult> res = precision
                                 ? SearchResultsHandler.filterContains(raw, kw)
@@ -133,13 +154,14 @@ public class AggregatedSearchAction {
                             if (onPage != null) onPage.accept(res);
                         }
                         if (onProgress != null) {
-                            onProgress.onProgress(searched.incrementAndGet(), total, found.get());
+                            onProgress.onProgress(searched.incrementAndGet(), total, found.get(), failed.get());
                         }
                     }
                 });
             }
         }
 
+        Console.log("<== 聚合搜索完成：成功 {} / 失败 {} / 共 {} 个书源，命中 {} 条", total - failed.get(), failed.get(), total, found.get());
         return SearchResultsHandler.filterAndSort(all, kw);
     }
 

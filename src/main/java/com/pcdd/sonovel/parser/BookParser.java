@@ -24,19 +24,21 @@ public class BookParser extends Source {
     @SneakyThrows
     public Book parse(String url) {
         Book r = this.rule.getBook();
+        Assert.notNull(r, "书源缺少详情页规则，无法解析书籍信息：{}", this.rule.getName());
         Document document = fetchDocument(url, r.getTimeout(), r.getBaseUri());
         document = handleCloudflareBypass(document, url, "详情页");
 
         String bookName = HtmlExtractor.extract(document, r.getBookName());
         String author = HtmlExtractor.extract(document, r.getAuthor());
-        Assert.isTrue(StrUtil.isAllNotEmpty(bookName, author), "详情页书名或作者不能为空！DOM:\n{}\n", document);
+        Assert.notBlank(bookName, "详情页书名不能为空！DOM:\n{}\n", document);
         String defaultCoverUrl = HtmlExtractor.extract(document, r.getCoverUrl());
 
         // 部分书源的 meta 格式不标准，需自定义 meta 书源规则
         Book book = new Book();
         book.setUrl(url);
         book.setBookName(bookName);
-        book.setAuthor(author.replace("作者：", ""));
+        // 分享书源常无作者信息，缺失时允许为空，不能因此中断整本下载
+        book.setAuthor(StrUtil.nullToEmpty(author).replace("作者：", ""));
         book.setIntro(StrUtil.cleanBlank(HtmlExtractor.extract(document, r.getIntro())));
         // 代理 IP 容易被起点等网站屏蔽，故使用源站封面
         book.setCoverUrl(this.rule.isNeedProxy() ? defaultCoverUrl : CoverUpdater.fetchCover(book, defaultCoverUrl));

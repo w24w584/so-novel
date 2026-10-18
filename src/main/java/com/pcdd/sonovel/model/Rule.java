@@ -19,6 +19,11 @@ public class Rule {
     private String disabledReason;
     private boolean shareSource;
     private String sourceGroup;
+    /**
+     * 仅支持搜索、不支持下载：分享书源的目录/正文规则缺失或依赖 <js> 无法转换时置为 true
+     */
+    private boolean searchOnly;
+    private String searchOnlyReason;
 
     private Search search;
     private Book book;

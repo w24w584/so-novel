@@ -106,6 +106,10 @@ public class ShareBookSourceLoader {
         item.put("name", s.getName());
         item.put("url", s.getUrl());
         item.put("disabled", s.isDisabled());
+        if (s.isSearchOnly()) {
+            item.put("searchOnly", true);
+            item.put("searchOnlyReason", s.getSearchOnlyReason());
+        }
         if (StrUtil.isNotBlank(s.getDisabledReason())) {
             item.put("disabledReason", s.getDisabledReason());
         }
@@ -298,27 +302,44 @@ public class ShareBookSourceLoader {
             rule.setBook(bookRule);
         }
 
+        List<String> noDownloadReasons = new ArrayList<>();
+
         JSONObject toc = item.getJSONObject("ruleToc");
-        if (toc != null && StrUtil.isNotBlank(toc.getStr("chapterList")) && !toc.getStr("chapterList").contains("<js>")) {
+        String chapterList = toc == null ? null : firstSelector(toc.get("chapterList"));
+        if (toc != null && StrUtil.isNotBlank(chapterList) && !chapterList.contains("<js>")) {
             Rule.Toc tocRule = new Rule.Toc();
             tocRule.setBaseUri(rule.getUrl());
-            tocRule.setItem(toSelector(toc.getStr("chapterList")));
+            tocRule.setItem(toSelector(chapterList));
             tocRule.setNextPageUrl(toSelector(resolvePagingSelector(toc)));
             tocRule.setDesc(false);
             rule.setToc(tocRule);
+        } else if (toc != null && StrUtil.isNotBlank(chapterList) && chapterList.contains("<js>")) {
+            noDownloadReasons.add("目录规则含 JS");
+        } else {
+            noDownloadReasons.add("缺少目录规则");
         }
 
         JSONObject content = item.getJSONObject("ruleContent");
-        if (content != null && StrUtil.isNotBlank(content.getStr("content"))
-                && !content.getStr("content").contains("<js>")) {
+        String contentRule = content == null ? null : firstSelector(content.get("content"));
+        if (content != null && StrUtil.isNotBlank(contentRule) && !contentRule.contains("<js>")) {
             Rule.Chapter chapterRule = new Rule.Chapter();
             chapterRule.setBaseUri(rule.getUrl());
-            chapterRule.setContent(toSelector(content.getStr("content")));
+            chapterRule.setContent(toSelector(contentRule));
             String nextContent = resolvePaging(content, "nextContentUrl");
             if (StrUtil.isNotBlank(nextContent)) {
                 chapterRule.setNextPage(toSelector(nextContent));
             }
             rule.setChapter(chapterRule);
+        } else if (content != null && StrUtil.isNotBlank(contentRule) && contentRule.contains("<js>")) {
+            noDownloadReasons.add("正文规则含 JS");
+        } else {
+            noDownloadReasons.add("缺少正文规则");
+        }
+
+        // 搜索可用但目录/正文无法转换时，标记为仅可搜索，避免下载时NPE或产出空文件
+        if (!noDownloadReasons.isEmpty()) {
+            rule.setSearchOnly(true);
+            rule.setSearchOnlyReason("该分享书源" + String.join("、", noDownloadReasons) + "，暂不支持下载");
         }
         return rule;
     }
@@ -368,9 +389,6 @@ public class ShareBookSourceLoader {
             }
         }
         url = simplifyShareExpressions(url);
-        if (!url.contains("{{key}}")) return null;
-        url = url.replace("{{key}}", "%s").replace("{{page}}", "1");
-        if (url.startsWith("/")) url = baseUrl + url;
 
         String method = options == null ? "get" : options.getStr("method", "get");
         String charset = options == null ? null : options.getStr("charset");
@@ -379,9 +397,9 @@ public class ShareBookSourceLoader {
             Object body = options.get("body");
             Map<String, Object> form = new LinkedHashMap<>();
             if (body instanceof JSONObject bodyObject) {
-                bodyObject.forEach((key, value) -> form.put(key, String.valueOf(value).replace("{{key}}", "%s")));
+                bodyObject.forEach((key, value) -> form.put(key, replacePlaceholders(String.valueOf(value))));
             } else {
-                String bodyText = String.valueOf(body).replace("{{key}}", "%s");
+                String bodyText = replacePlaceholders(String.valueOf(body));
                 for (String pair : bodyText.split("&")) {
                     String[] parts = pair.split("=", 2);
                     if (parts.length == 2) form.put(parts[0], parts[1]);
@@ -390,8 +408,26 @@ public class ShareBookSourceLoader {
             if (form.isEmpty()) return null;
             data = JSONUtil.toJsonStr(form);
         }
+
+        // legado 的 POST 书源常把 {{key}} 放在请求体里，此时 URL 本身不含模板，需一并接受
+        boolean urlHasKey = url.contains("{{key}}");
+        boolean bodyHasKey = data != null && data.contains("%s");
+        if (!urlHasKey && !bodyHasKey) return null;
+
+        url = replacePlaceholders(url).trim();
+        if (url.isEmpty()) {
+            url = baseUrl;
+        } else if (url.startsWith("/")) {
+            // 避免 baseUrl 以 / 结尾时拼出双斜杠
+            url = baseUrl.endsWith("/") ? baseUrl + url.substring(1) : baseUrl + url;
+        }
         if (StrUtil.isBlank(url) || ("post".equalsIgnoreCase(method) && data == null)) return null;
         return new ParsedRequest(url, method, data, charset);
+    }
+
+    /** 将 legado 模板变量替换为占位符：{{key}} -> %s，{{page}} -> 1 */
+    private String replacePlaceholders(String text) {
+        return text.replace("{{key}}", "%s").replace("{{page}}", "1");
     }
 
     private String simplifyShareExpressions(String url) {
@@ -414,7 +450,9 @@ public class ShareBookSourceLoader {
 
     private String normalizeOptions(String options) {
         String normalized = options.replaceAll("'((?:\\\\.|[^'\\\\])*)'", "\"$1\"")
-                .replaceAll("([,{]\\s*)([A-Za-z_$][\\w$-]*)(\\s*:)", "$1\"$2\"$3");
+                .replaceAll("([,{]\\s*)([A-Za-z_$][\\w$-]*)(\\s*:)", "$1\"$2\"$3")
+                // legado 模板变量（如 "keyword":{{key}}）不是合法 JSON 值，补上引号后再解析
+                .replaceAll("(:\\s*)(\\{\\{[^{}]*\\}\\})", "$1\"$2\"");
         return normalized.replaceAll(",\\s*([}\\]])", "$1");
     }
 

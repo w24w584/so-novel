@@ -35,7 +35,7 @@ const Api = {
             if (json.type === 'stream_page') {
               onPage && onPage(json.results || [])
             } else if (json.type === 'stream_progress') {
-              onProgress && onProgress(json.done || 0, json.total || 0, json.found || 0)
+              onProgress && onProgress(json.done || 0, json.total || 0, json.found || 0, json.failed || 0)
             } else if (json.type === 'stream_done') {
               onDone && onDone(json.results || [])
             } else if (json.type === 'stream_error') {

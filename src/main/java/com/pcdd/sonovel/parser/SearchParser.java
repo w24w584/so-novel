@@ -20,6 +20,7 @@ import com.pcdd.sonovel.model.Rule.Book;
 import com.pcdd.sonovel.model.SearchResult;
 import com.pcdd.sonovel.utils.ChineseConverter;
 import com.pcdd.sonovel.utils.CrawlUtils;
+import com.pcdd.sonovel.utils.EnvUtils;
 import com.pcdd.sonovel.utils.JsCaller;
 import lombok.SneakyThrows;
 import okhttp3.OkHttpClient;
@@ -48,13 +49,20 @@ public class SearchParser extends Source {
 
     private static final int TEXT_LIMIT_LENGTH = 30;
     private final OkHttpClient httpClient = HttpClientContext.get();
+    /** 最近一次 parse 是否因异常失败（用于区分“无结果”与“出错”，供聚合搜索统计失败书源数） */
+    private boolean parseFailed;
 
     public SearchParser(AppConfig config) {
         super(config);
     }
 
+    public boolean isParseFailed() {
+        return parseFailed;
+    }
+
     @SneakyThrows
     public List<SearchResult> parse(String keyword) {
+        parseFailed = false;
         Rule.Search r = this.rule.getSearch();
 
         if (r == null) {
@@ -98,8 +106,11 @@ public class SearchParser extends Source {
             document = handleCloudflareBypass(document, searchUrl, "搜索页");
 
         } catch (Exception e) {
-            Console.error(render("<== 书源 {} ({}) 搜索解析出错: {}", "red"),
-                    this.rule.getId(), this.rule.getName(), e.getMessage());
+            parseFailed = true;
+            if (EnvUtils.isDev()) {
+                Console.error(render("<== 书源 {} ({}) 搜索解析出错: {}", "red"),
+                        this.rule.getId(), this.rule.getName(), e.getMessage());
+            }
             return Collections.emptyList();
         }
 
@@ -185,8 +196,10 @@ public class SearchParser extends Source {
                 String bookName = HtmlExtractor.extract(el, r.getBookName());
                 if (bookName.isEmpty()) continue;
                 if (StrUtil.isBlank(href)) {
-                    Console.error("<== 书源 {} ({}) 搜索结果“{}”没有提取到书籍详情链接，已跳过",
-                            this.rule.getId(), this.rule.getName(), bookName);
+                    if (EnvUtils.isDev()) {
+                        Console.error("<== 书源 {} ({}) 搜索结果“{}”没有提取到书籍详情链接，已跳过",
+                                this.rule.getId(), this.rule.getName(), bookName);
+                    }
                     continue;
                 }
 
@@ -208,7 +221,10 @@ public class SearchParser extends Source {
                 list.add(ChineseConverter.convert(sr, this.rule.getLanguage(), config.getLanguage()));
             }
         } catch (Exception e) {
-            Console.error(e);
+            parseFailed = true;
+            if (EnvUtils.isDev()) {
+                Console.error(e);
+            }
             return Collections.emptyList();
         }
 
@@ -394,8 +410,10 @@ public class SearchParser extends Source {
         try {
             return JsCaller.eval(wrappedJs);
         } catch (Exception e) {
-            Console.error("<== 书源 {} ({}) searchUrl @js: 执行失败: {}",
-                    this.rule.getId(), this.rule.getName(), e.getMessage());
+            if (EnvUtils.isDev()) {
+                Console.error("<== 书源 {} ({}) searchUrl @js: 执行失败: {}",
+                        this.rule.getId(), this.rule.getName(), e.getMessage());
+            }
             return null;
         }
     }
