@@ -16,6 +16,9 @@ public class Rule {
     private String language;
     private boolean needProxy;
     private boolean disabled;
+    private String disabledReason;
+    private boolean shareSource;
+    private String sourceGroup;
 
     private Search search;
     private Book book;
@@ -32,7 +35,9 @@ public class Rule {
         private String url;
         private String method;
         private String data;
+        private String charset;
         private String cookies;
+        private java.util.Map<String, String> headers;
         private String result;
         private String bookName;
         private String author;
@@ -70,14 +75,13 @@ public class Rule {
         private String item;
         private boolean isDesc;
         private String nextPage;
+        private String nextPageUrl;
     }
 
     @Data
     public static class Chapter {
         private String baseUri;
         private Integer timeout;
-        // 用于测试
-        private String title;
         private String content;
         private boolean paragraphTagClosed;
         private String paragraphTag;

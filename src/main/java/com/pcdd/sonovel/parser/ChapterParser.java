@@ -3,8 +3,6 @@ package com.pcdd.sonovel.parser;
 import cn.hutool.core.lang.Assert;
 import cn.hutool.core.lang.Console;
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.http.HttpUtil;
-import com.pcdd.sonovel.context.HttpClientContext;
 import com.pcdd.sonovel.core.ChapterRenderer;
 import com.pcdd.sonovel.core.HtmlExtractor;
 import com.pcdd.sonovel.core.Source;
@@ -13,13 +11,14 @@ import com.pcdd.sonovel.utils.ChineseConverter;
 import com.pcdd.sonovel.utils.CrawlUtils;
 import com.pcdd.sonovel.utils.LogUtils;
 import lombok.SneakyThrows;
-import okhttp3.OkHttpClient;
-import okhttp3.Response;
-import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
-import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
  * @author pcdd
@@ -27,7 +26,6 @@ import java.io.InputStream;
  */
 public class ChapterParser extends Source {
 
-    private final OkHttpClient httpClient = HttpClientContext.get();
     private final ChapterRenderer chapterRenderer;
 
     public ChapterParser(AppConfig config) {
@@ -109,17 +107,12 @@ public class ChapterParser extends Source {
 
     @SneakyThrows
     private String fetchSinglePageContent(String url, Rule.Chapter r) {
-        Document doc;
-        try (Response resp = CrawlUtils.request(httpClient, url, r.getTimeout());
-             InputStream is = resp.body().byteStream()) {
-            // null 表示自动检测编码
-            doc = Jsoup.parse(is, null, r.getBaseUri());
-        }
+        Document doc = fetchDocument(url, r.getTimeout(), r.getBaseUri());
 
-        doc = handleCloudflareBypass(doc, url);
+        doc = handleCloudflareBypass(doc, url, "章节页");
         String content = HtmlExtractor.extract(doc, r.getContent(), ContentType.HTML);
         Assert.notEmpty(content, "正文内容为空:\n{}\n", doc);
-
+        logIfSuspicious(url, content, r.getContent(), doc);
         return content;
     }
 
@@ -127,20 +120,23 @@ public class ChapterParser extends Source {
     private String fetchPaginatedContent(String startUrl, long interval, Rule.Chapter r) {
         String nextUrl = startUrl;
         StringBuilder contentBuilder = new StringBuilder();
+        List<String> pageChain = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
 
         while (true) {
-            Document doc;
-            try (Response resp = CrawlUtils.request(httpClient, nextUrl, r.getTimeout());
-                 InputStream is = resp.body().byteStream()) {
-                // null 表示自动检测编码
-                doc = Jsoup.parse(is, null, r.getBaseUri());
+            if (!visited.add(nextUrl)) {
+                Console.log("[正文诊断] 章节 {} 出现重复翻页地址，中止: {}", startUrl, nextUrl);
+                break;
             }
+            Document doc = fetchDocument(nextUrl, r.getTimeout(), r.getBaseUri());
 
-            doc = handleCloudflareBypass(doc, nextUrl);
+            doc = handleCloudflareBypass(doc, nextUrl, "章节页");
 
             String content = HtmlExtractor.extract(doc, r.getContent(), ContentType.HTML);
             Assert.notEmpty(content, "正文内容为空:\n{}\n", doc);
+            logIfSuspicious(nextUrl, content, r.getContent(), doc);
             contentBuilder.append(content);
+            pageChain.add(nextUrl + " [" + content.trim().length() + "字]");
 
             // 获取下一页按钮元素
             Elements nextEls = HtmlExtractor.select(doc, r.getNextPage());
@@ -154,18 +150,26 @@ public class ChapterParser extends Source {
             Thread.sleep(interval);
         }
 
-        return contentBuilder.toString();
+        String result = contentBuilder.toString();
+        if (result.trim().length() < 200) {
+            Console.log("[正文翻页诊断] 章节 {} 最终正文仅 {} 字，翻页链共 {} 页: {}",
+                    startUrl, result.trim().length(), pageChain.size(), pageChain);
+        }
+        return result;
     }
 
-    private Document handleCloudflareBypass(Document doc, String url) {
-        if (CrawlUtils.hasCf(doc)) {
-            Assert.isTrue(StrUtil.isNotEmpty(config.getCfBypass()), "🤖 检测到章节页 {} 存在 Cloudflare 真人验证，但未设置 cf-bypass 配置项，故跳过", url);
-            LogUtils.logByProgressbar(LogLevel.INFO, config.getEnableProgressbar(),
-                    "🤖 检测到章节页 {} 存在 Cloudflare 真人验证，正在尝试绕过...", url);
-            String html = HttpUtil.get("%s/html?url=%s".formatted(this.config.getCfBypass(), url));
-            doc = Jsoup.parse(html);
+    /** 正文过短时打诊断日志，打印命中节点数与 #content 容器原始 HTML，用于一步定位正文真实结构 */
+    private void logIfSuspicious(String url, String content, String selector, Document doc) {
+        if (content == null) return;
+        String trimmed = content.trim();
+        if (trimmed.length() < 80 && doc != null) {
+            int nodes = HtmlExtractor.select(doc, selector).size();
+            Element container = doc.selectFirst("#content");
+            String html = container == null ? "" : container.html();
+            Console.log("[正文诊断] 章节 {} 命中 {} 个节点，正文仅 {} 字。选择器: {}，前200字: {}，[#content 片段]: {}",
+                    url, nodes, trimmed.length(), selector,
+                    StrUtil.brief(trimmed, 200), StrUtil.brief(html, 600));
         }
-        return doc;
     }
 
     private String resolveNextUrl(Document doc, Elements nextEls, Rule.Chapter r) {
@@ -174,8 +178,7 @@ public class ChapterParser extends Source {
             return HtmlExtractor.extract(doc, r.getNextPageInJs(), ContentType.HTML);
         }
         if (nextEls.isEmpty()) {
-            LogUtils.logByProgressbar(LogLevel.ERROR, config.getEnableProgressbar(),
-                    "分页章节正文获取为空，可能被限流！出错链接: {} 链接内容:\n{}\n", doc.baseUri(), doc);
+            // 没有“下一页”按钮，即已到本章最后一页，属正常结束
             return null;
         }
         // 从按钮获取下一页链接

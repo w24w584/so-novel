@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.http.HtmlUtil;
 import com.pcdd.sonovel.model.AppConfig;
 import com.pcdd.sonovel.model.Chapter;
+import com.pcdd.sonovel.model.Rule;
 import com.pcdd.sonovel.utils.CrawlUtils;
 import com.pcdd.sonovel.utils.HtmlUtils;
 
@@ -97,9 +98,12 @@ public class ChapterFilter extends Source {
             }
 
             if (applyAdsFilter) {
-                String filteredContent = this.content.replaceAll(rule.getChapter().getFilterTxt(), "");
+                Rule.Chapter chapterRule = rule.getChapter();
+                String filterTxt = chapterRule == null ? null : chapterRule.getFilterTxt();
+                // 分享书源未配置广告过滤规则时 filterTxt 为 null，直接 replaceAll 会抛 NPE 导致整章下载失败
+                String filteredContent = StrUtil.isBlank(filterTxt) ? this.content : this.content.replaceAll(filterTxt, "");
                 // filterTag 格式需修改为 div.tt-title, #title, [style]
-                this.content = HtmlUtils.removeTags(filteredContent, rule.getChapter().getFilterTag());
+                this.content = HtmlUtils.removeTags(filteredContent, chapterRule == null ? null : chapterRule.getFilterTag());
             }
 
             // 删除正文开头的标题，Pattern.quote：将章节名当作纯文本，自动转义正则元字符 [、(、. 防止章节名意外破坏正则

@@ -13,6 +13,7 @@ public class SearchResult {
 
     private Integer sourceId;
     private String sourceName;
+    private String sourceGroup;
     private String url;
     private String bookName;
     private String author;

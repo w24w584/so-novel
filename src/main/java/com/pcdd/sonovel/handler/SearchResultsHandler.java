@@ -76,6 +76,18 @@ public class SearchResultsHandler {
     }
 
     /**
+     * 精准搜索：仅保留书名或作者包含搜索词的结果。
+     */
+    public List<SearchResult> filterContains(List<SearchResult> list, String kw) {
+        if (CollUtil.isEmpty(list) || StrUtil.isBlank(kw)) return list;
+        String k = kw.trim().toLowerCase(Locale.ROOT);
+        return list.stream()
+                .filter(sr -> StrUtil.containsIgnoreCase(StrUtil.nullToEmpty(sr.getBookName()), k)
+                        || StrUtil.containsIgnoreCase(StrUtil.nullToEmpty(sr.getAuthor()), k))
+                .toList();
+    }
+
+    /**
      * 计算权重，用于判断关键字是书名还是作者
      */
     private double computeWeight(Map<SearchResult, Double> simMap, String kw) {

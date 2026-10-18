@@ -63,6 +63,7 @@ public class AppConfigLoader {
     public AppConfig loadConfig() {
         AppConfig cfg = new AppConfig();
         cfg.setVersion(sys().getStr("version"));
+        cfg.setBuildTime(sys().getStr("build-time"));
         Setting setting = usr();
 
         // [global]

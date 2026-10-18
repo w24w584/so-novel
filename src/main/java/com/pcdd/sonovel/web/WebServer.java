@@ -48,6 +48,8 @@ public class WebServer {
         context.addServlet(BookDeleteServlet.class, "/book-delete");
         context.addServlet(SourceListServlet.class, "/sources");
         context.addServlet(SourceListServlet.class, "/sources/check");
+        context.addServlet(ShareSourceListServlet.class, "/share-sources");
+        context.addServlet(ShareSourceReloadServlet.class, "/share-sources/reload");
         context.addServlet(SuggestionServlet.class, "/suggestion");
 
         ServletHolder staticHolder = new ServletHolder("default", DefaultServlet.class);
