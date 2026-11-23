@@ -3,6 +3,7 @@ package com.pcdd.sonovel.web.servlet;
 import cn.hutool.json.JSONUtil;
 import com.pcdd.sonovel.utils.ShareBookSourceLoader;
 import com.pcdd.sonovel.utils.ShareBookSourceLoader.ProgressEvent;
+import com.pcdd.sonovel.web.util.RespUtils;
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServlet;
@@ -23,6 +24,12 @@ public class ShareSourceReloadServlet extends HttpServlet {
 
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        // 全量重解析几万条规则很重，多人同时点会把 CPU 打满：同一时刻只放行一个任务
+        if (!ShareBookSourceLoader.tryBeginReload()) {
+            RespUtils.writeError(resp, 409, "已有书源重读任务正在进行中，请稍后再试");
+            return;
+        }
+
         resp.setStatus(HttpServletResponse.SC_OK);
         resp.setContentType("text/event-stream;charset=UTF-8");
         resp.setHeader("Cache-Control", "no-cache");
@@ -77,6 +84,7 @@ public class ShareSourceReloadServlet extends HttpServlet {
                 } catch (IOException ignored) {
                 }
             } finally {
+                ShareBookSourceLoader.endReload();
                 async.complete();
             }
         });

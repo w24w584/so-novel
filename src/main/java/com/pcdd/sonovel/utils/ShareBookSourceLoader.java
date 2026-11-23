@@ -1,5 +1,6 @@
 package com.pcdd.sonovel.utils;
 
+import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.lang.Console;
 import cn.hutool.core.util.CharsetUtil;
@@ -23,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
@@ -67,9 +69,11 @@ public class ShareBookSourceLoader {
 
     private List<ShareFile> loadFiles() {
         File directory = resolveRulesDirectory();
-        Console.log("[书源] 开始加载分享书源，实际目录: {}（工作目录: {}）",
-                directory == null ? "null" : directory.getAbsolutePath(),
-                new File("").getAbsolutePath());
+        if (EnvUtils.isDev()) {
+            Console.log("[书源] 开始加载分享书源，实际目录: {}（工作目录: {}）",
+                    directory == null ? "null" : directory.getAbsolutePath(),
+                    new File("").getAbsolutePath());
+        }
         if (directory == null) {
             return List.of();
         }
@@ -135,6 +139,9 @@ public class ShareBookSourceLoader {
                 Rule source = file.sources().get(i);
                 sourceIndex++;
                 if (source.isDisabled()) continue;
+                // 缓存里的是"书源定义"，多个并发搜索/下载会共用同一实例；
+                // 这里必须拷贝一份再改写 id/sourceGroup，否则会产生跨请求的相互覆盖
+                source = copyOf(source);
                 source.setId(baseRuleCount + sourceIndex);
                 source.setSourceGroup(file.name());
                 String sourceId = file.name() + "#" + i;
@@ -144,6 +151,36 @@ public class ShareBookSourceLoader {
             }
         }
         return result;
+    }
+
+    /** 深拷贝一条书源规则（含各子规则与请求头），保证调用方可安全改写而不影响缓存 */
+    private Rule copyOf(Rule src) {
+        Rule copy = new Rule();
+        BeanUtil.copyProperties(src, copy);
+        if (src.getSearch() != null) {
+            Rule.Search search = new Rule.Search();
+            BeanUtil.copyProperties(src.getSearch(), search);
+            if (src.getSearch().getHeaders() != null) {
+                search.setHeaders(new LinkedHashMap<>(src.getSearch().getHeaders()));
+            }
+            copy.setSearch(search);
+        }
+        if (src.getBook() != null) {
+            Rule.Book book = new Rule.Book();
+            BeanUtil.copyProperties(src.getBook(), book);
+            copy.setBook(book);
+        }
+        if (src.getToc() != null) {
+            Rule.Toc toc = new Rule.Toc();
+            BeanUtil.copyProperties(src.getToc(), toc);
+            copy.setToc(toc);
+        }
+        if (src.getChapter() != null) {
+            Rule.Chapter chapter = new Rule.Chapter();
+            BeanUtil.copyProperties(src.getChapter(), chapter);
+            copy.setChapter(chapter);
+        }
+        return copy;
     }
 
     public Rule findById(int id, int baseRuleCount) {
@@ -621,9 +658,24 @@ public class ShareBookSourceLoader {
 
     private static final int SOURCE_READ_TIMEOUT_SECONDS = 10;
 
+    /** 重读闸门：全量重解析是重量级操作，同一时刻只允许一个任务，避免多人同时点把 CPU 打满 */
+    private static final AtomicBoolean RELOADING = new AtomicBoolean(false);
+
+    /** 尝试占用重读闸门，返回 false 表示已有任务在进行中 */
+    public static boolean tryBeginReload() {
+        return RELOADING.compareAndSet(false, true);
+    }
+
+    /** 释放重读闸门，必须与 {@link #tryBeginReload()} 成对调用 */
+    public static void endReload() {
+        RELOADING.set(false);
+    }
+
     /**
-     * 增量读取额外书源：逐条读取、实时上报进度、逐条打日志、出错跳过、单条超时保护。
+     * 增量读取额外书源：逐条读取、实时上报进度、出错跳过、单条超时保护。
      * 返回与 {@link #listSourcesGrouped()} 一致的分组结构，供前端直接替换展示。
+     * <p>
+     * 调用方需先通过 {@link #tryBeginReload()} 占住闸门，结束后 {@link #endReload()} 释放。
      */
     public List<Map<String, Object>> reloadGrouped(Consumer<ProgressEvent> onProgress) {
         // 重读到磁盘最新文件后，失效旧缓存，避免后续搜索继续用旧的解析结果
@@ -660,7 +712,9 @@ public class ShareBookSourceLoader {
                     String fileName = file.getName();
 
                     onProgress.accept(new ProgressEvent(index, total, fileName, rawName, true, true, "开始读取"));
-                    Console.log("开始读取额外书源 [{}/{}] {} <- {}", index, total, fileName, rawName);
+                    if (EnvUtils.isDev()) {
+                        Console.log("开始读取额外书源 [{}/{}] {} <- {}", index, total, fileName, rawName);
+                    }
 
                     if (!(value instanceof JSONObject item)) {
                         onProgress.accept(new ProgressEvent(index, total, fileName, rawName, false, false, "条目格式无效"));
@@ -685,7 +739,9 @@ public class ShareBookSourceLoader {
                     sources.add(itemMap);
                     long cost = System.currentTimeMillis() - start;
                     String state = rule.isDisabled() ? "（解析完成，但不可用）" : "";
-                    Console.log("完成读取额外书源 [{}/{}] {} -> {}{} ({} ms)", index, total, fileName, rule.getName(), state, cost);
+                    if (EnvUtils.isDev()) {
+                        Console.log("完成读取额外书源 [{}/{}] {} -> {}{} ({} ms)", index, total, fileName, rule.getName(), state, cost);
+                    }
                     onProgress.accept(new ProgressEvent(index, total, fileName, rule.getName(), false, true, "已读取" + state));
                 }
                 if (!sources.isEmpty()) {

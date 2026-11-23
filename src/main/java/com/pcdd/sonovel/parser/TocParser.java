@@ -34,6 +34,10 @@ import static com.pcdd.sonovel.model.ContentType.ATTR_VALUE;
 
 public class TocParser extends Source {
 
+    /** 目录自动翻页的页数上限与总耗时预算，防止站点异常时把整个下载拖到不可控 */
+    private static final int MAX_PAGINATION_PAGES = 500;
+    private static final long PAGINATION_BUDGET_MS = 90_000L;
+
     public TocParser(AppConfig config) {
         super(config);
     }
@@ -140,7 +144,13 @@ public class TocParser extends Source {
     private void collectGenericPagination(Set<String> urls, String firstUrl, Rule.Toc r) {
         Set<String> visited = new HashSet<>();
         String current = firstUrl;
-        for (int i = 0; i < 500; i++) {
+        long deadline = System.currentTimeMillis() + PAGINATION_BUDGET_MS;
+        for (int i = 0; i < MAX_PAGINATION_PAGES; i++) {
+            if (System.currentTimeMillis() > deadline) {
+                Console.log("<== 目录自动翻页超过 {}s 预算，停止继续翻页: {}",
+                        PAGINATION_BUDGET_MS / 1000, firstUrl);
+                return;
+            }
             Document doc = fetchDocument(current, r.getTimeout(), r.getBaseUri());
             doc = handleCloudflareBypass(doc, current, "目录页");
             String next = findNextPageUrl(doc);
@@ -154,6 +164,12 @@ public class TocParser extends Source {
     }
 
     private String findNextPageUrl(Document doc) {
+        // 优先用 rel=next 语义标记，跨站最稳定
+        Element relNext = doc.selectFirst("a[rel=next][href], link[rel=next][href]");
+        if (relNext != null && StrUtil.isNotBlank(relNext.absUrl("href"))) {
+            return relNext.absUrl("href");
+        }
+        // 其次按常见中文文案兜底
         for (Element a : doc.select("a[href]")) {
             String t = a.text().trim();
             if (t.contains("下一页") || t.contains("下页") || t.contains("尾页")

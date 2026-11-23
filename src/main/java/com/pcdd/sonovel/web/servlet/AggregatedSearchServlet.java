@@ -7,6 +7,7 @@ import com.pcdd.sonovel.actions.AggregatedSearchAction;
 import com.pcdd.sonovel.core.AppConfigLoader;
 import com.pcdd.sonovel.model.SearchResult;
 import com.pcdd.sonovel.web.util.RespUtils;
+import jakarta.servlet.AsyncContext;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
@@ -18,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class AggregatedSearchServlet extends HttpServlet {
@@ -69,28 +71,41 @@ public class AggregatedSearchServlet extends HttpServlet {
         resp.setHeader("X-Accel-Buffering", "no");
         resp.setCharacterEncoding("UTF-8");
 
-        ServletOutputStream out = resp.getOutputStream();
         Object writeLock = new Object();
         AtomicBoolean closed = new AtomicBoolean(false);
 
+        // 聚合搜索可能持续数十秒，不能让请求线程一直阻塞：转异步 + 虚拟线程，
+        // 这样并发用户再多也不会耗尽 Jetty 的请求线程
+        AsyncContext async = req.startAsync();
+        async.setTimeout(TimeUnit.MINUTES.toMillis(10));
+        ServletOutputStream output;
         try {
-            List<SearchResult> finalResults = AggregatedSearchAction.streamSearch(
-                    name, shareSourceIds, mainSourceIds, precision,
-                    batch -> sendSse(out, writeLock, closed, pageEvent(batch)),
-                    (done, total, found, failed) ->
-                            sendSse(out, writeLock, closed, progressEvent(done, total, found, failed)));
-
-            sendSse(out, writeLock, closed, doneEvent(finalResults, maxResults));
-        } catch (Exception e) {
-            sendSse(out, writeLock, closed, errorEvent(e.getMessage()));
-        } finally {
-            if (!closed.get()) {
-                try {
-                    out.flush();
-                } catch (IOException ignored) {
-                }
-            }
+            output = resp.getOutputStream();
+        } catch (IOException e) {
+            async.complete();
+            return;
         }
+        Thread.startVirtualThread(() -> {
+            try {
+                List<SearchResult> finalResults = AggregatedSearchAction.streamSearch(
+                        name, shareSourceIds, mainSourceIds, precision,
+                        batch -> sendSse(output, writeLock, closed, pageEvent(batch)),
+                        (done, total, found, failed) ->
+                                sendSse(output, writeLock, closed, progressEvent(done, total, found, failed)));
+
+                sendSse(output, writeLock, closed, doneEvent(finalResults, maxResults));
+            } catch (Exception e) {
+                sendSse(output, writeLock, closed, errorEvent(e.getMessage()));
+            } finally {
+                if (!closed.get()) {
+                    try {
+                        output.flush();
+                    } catch (IOException ignored) {
+                    }
+                }
+                async.complete();
+            }
+        });
     }
 
     /**

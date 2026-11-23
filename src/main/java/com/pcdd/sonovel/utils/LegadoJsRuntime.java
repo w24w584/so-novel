@@ -8,6 +8,7 @@ import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.caoccao.javet.annotations.V8Function;
+import com.caoccao.javet.enums.V8RuntimeTerminationMode;
 import com.caoccao.javet.interop.V8Runtime;
 import com.caoccao.javet.interop.converters.JavetProxyConverter;
 import com.caoccao.javet.interop.engine.IJavetEngine;
@@ -35,7 +36,11 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -55,6 +60,14 @@ public class LegadoJsRuntime {
     /** legado 请求参数后缀：url,{...} */
     private static final Pattern OPTIONS_SUFFIX = Pattern.compile(",\\s*(\\{.*})\\s*$", Pattern.DOTALL);
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
+    /** 单次 JS 执行的硬超时：书源 JS 里出现死循环时中止执行，避免下载线程与引擎被永久占用（可用 -Dsonovel.js-timeout-seconds 覆盖，便于测试） */
+    private static final int JS_EXEC_TIMEOUT_SECONDS = Integer.getInteger("sonovel.js-timeout-seconds", 15);
+    /** 超时看门狗线程（守护线程，不阻止 JVM 退出） */
+    private static final ScheduledExecutorService WATCHDOG = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "legado-js-watchdog");
+        t.setDaemon(true);
+        return t;
+    });
 
     /** JS 规则返回的章节项：html 为元素片段，或明确给出 text/href */
     public record TocItem(String html, String text, String href) {}
@@ -91,25 +104,73 @@ public class LegadoJsRuntime {
             v8.getGlobalObject().set("__sourceKey", StrUtil.nullToEmpty(sourceKey));
 
             String script = buildScript(jsCode);
-            String json;
-            try {
-                json = v8.getExecutor(script).executeString();
-            } finally {
-                // 引擎归还池后会被下一个书源复用，必须清掉本次注入的 bridge/页面内容，
-                // 否则上一个书源的 HTML 会被长期持有，且其全局变量可能污染后续脚本
-                try {
-                    var global = v8.getGlobalObject();
-                    global.delete("__bridge");
-                    global.delete("__result");
-                    global.delete("__baseUrl");
-                    global.delete("__sourceKey");
-                } catch (Exception ignored) {
-                }
-            }
-            return toItems(json);
+            String json = executeWithTimeout(v8, engine, script);
+            return json == null ? List.of() : toItems(json);
         } catch (Exception e) {
             Console.error("<== 执行分享书源目录 JS 规则失败: {}", e.getMessage());
             return List.of();
+        }
+    }
+
+    /**
+     * 带硬超时地执行脚本。
+     * <p>
+     * 书源 JS 属于外部代码，一旦出现 {@code while(true)} 或超大循环，{@code executeString} 会永不返回，
+     * 既占死调用线程，也让引擎无法归还池（池被占满后所有下载都会卡住）。
+     * 这里用看门狗线程到点调用 {@code terminateExecution} 中止执行，并重置上下文后再归还引擎。
+     *
+     * @return 执行结果；超时被中止时返回 null
+     * @throws Exception 非超时导致的执行异常
+     */
+    private static String executeWithTimeout(V8Runtime v8, IJavetEngine<V8Runtime> engine, String script) throws Exception {
+        AtomicBoolean finished = new AtomicBoolean(false);
+        AtomicBoolean terminated = new AtomicBoolean(false);
+        ScheduledFuture<?> timer = WATCHDOG.schedule(() -> {
+            if (finished.compareAndSet(false, true)) {
+                terminated.set(true);
+                try {
+                    v8.terminateExecution(V8RuntimeTerminationMode.Asynchronous);
+                } catch (Exception ignored) {
+                    // 引擎已释放等极端情况，忽略
+                }
+            }
+        }, JS_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        try {
+            return v8.getExecutor(script).executeString();
+        } catch (Exception e) {
+            if (terminated.get()) {
+                Console.error("<== 分享书源 JS 执行超过 {}s，已中止: {}", JS_EXEC_TIMEOUT_SECONDS, e.getMessage());
+                return null;
+            }
+            throw e;
+        } finally {
+            finished.set(true);
+            timer.cancel(false);
+            clearGlobals(v8);
+            if (terminated.get()) {
+                // 中止后的运行时状态不可信：取消中止标记并重置 JS 上下文，避免污染下一个书源
+                try {
+                    v8.cancelTerminateExecution();
+                } catch (Exception ignored) {
+                }
+                try {
+                    engine.resetContext();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    /** 引擎归还池后会被下一个书源复用，必须清掉本次注入的 bridge/页面内容，避免持有上一个书源的大对象 */
+    private static void clearGlobals(V8Runtime v8) {
+        try {
+            var global = v8.getGlobalObject();
+            global.delete("__bridge");
+            global.delete("__result");
+            global.delete("__baseUrl");
+            global.delete("__sourceKey");
+        } catch (Exception ignored) {
         }
     }
 
