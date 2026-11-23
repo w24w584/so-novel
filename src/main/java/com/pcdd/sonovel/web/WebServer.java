@@ -43,6 +43,7 @@ public class WebServer {
         context.addServlet(BookDownloadServlet.class, "/book-download");
         context.addServlet(LocalBookListServlet.class, "/local-books");
         context.addServlet(AggregatedSearchServlet.class, "/search/aggregated");
+        context.addServlet(SearchCancelServlet.class, "/search/aggregated/cancel");
         context.addServlet(DownloadProgressSseServlet.class, "/download-progress");
         context.addServlet(ConfigServlet.class, "/config");
         context.addServlet(BookDeleteServlet.class, "/book-delete");

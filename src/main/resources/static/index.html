@@ -696,6 +696,8 @@
       SETTINGS_KEY: 'sonovel-settings',
 
       bookCache: [],
+      _pageBuffer: [],
+      _pageFlushTimer: null,
       currentPage: 1,
       dropdownItem: null,
       dropdownStyle: '',
@@ -917,31 +919,18 @@
         this.shareSourcesLoaded = 0
         this.shareSourcesTotal = 0
         this.shareSourcesSummary = ''
-        return new Promise((resolve) => {
-          const es = Api.reloadShareSources()
-
-          es.onerror = () => {
-            // 手动关闭，避免断线后 SSE 自动重连导致重复读取
-            es.close()
-            this.shareSourcesSummary = this.shareSourcesSummary || '读取额外书源失败，请稍后重试'
-            resolve()
-          }
-
-          es.onmessage = (e) => {
-            let msg
-            try {
-              msg = JSON.parse(e.data)
-            } catch (err) {
-              console.error('[额外书源] 进度数据解析失败', err, e.data)
-              return
-            }
-
+        let finished = false
+        try {
+          const sse = await Api.reloadShareSources()
+          this._reloadCancel = sse.cancel
+          await sse.stream((msg) => {
             if (msg.type === 'progress') {
               this.shareSourcesLoaded = msg.index
               this.shareSourcesTotal = msg.total
               // 读取一条，控制台打印一条详细进程
               console.log(`[额外书源] 读取进度 ${msg.index}/${msg.total} ${msg.fileName} -> ${msg.sourceName} ${msg.ok ? 'OK' : '跳过'} | ${msg.message}`)
             } else if (msg.type === 'done') {
+              finished = true
               if (Array.isArray(msg.data)) {
                 this.shareSources = msg.data
                 this.shareSourcesFetched = true
@@ -953,17 +942,21 @@
               }
               this.shareSourcesSummary = `读取完成：成功 ${msg.success ?? 0}，跳过 ${msg.skipped ?? 0}`
               console.log(`[额外书源] 读取完成：成功 ${msg.success}, 跳过 ${msg.skipped}`)
-              es.close()
-              resolve()
             } else if (msg.type === 'error') {
+              finished = true
               this.shareSourcesSummary = '读取失败：' + (msg.message || '未知错误')
-              es.close()
-              resolve()
             }
+          })
+          if (!finished) {
+            this.shareSourcesSummary = this.shareSourcesSummary || '读取已中断，请检查服务状态'
           }
-        }).finally(() => {
+        } catch (e) {
+          // 409（已有重读任务）等错误的具体文案在这里能拿到
+          this.shareSourcesSummary = '读取失败：' + (e.message || '未知错误')
+        } finally {
+          this._reloadCancel = null
           this.shareSourcesLoading = false
-        })
+        }
       },
 
       async checkSources() {
@@ -987,6 +980,8 @@
         this.isSearching = true
         this._searchCancelled = false
         this.bookCache = []
+        this._pageBuffer = []
+        this._clearPageFlushTimer()
         this.currentPage = 1
         this.searchScanDone = 0
         this.searchScanTotal = 0
@@ -1010,7 +1005,7 @@
           await s.stream({
             onPage: (page) => {
               if (!page || !page.length) return
-              this.bookCache = this.bookCache.concat(page)
+              this._queuePage(page)
             },
             onProgress: (done, total, found, failed) => {
               this.searchScanDone = done
@@ -1018,10 +1013,16 @@
               this.searchFoundCount = found
               this.searchFailedCount = failed
             },
-            onDone: () => {
+            onDone: (finalResults) => {
               if (this._searchCancelled) return
               this.isSearching = false
               this.searchScanDone = this.searchScanTotal
+              this._flushPageBuffer()
+              // 服务端已做过相似度过滤/排序并套用 searchLimit，定稿时以它为准，
+              // 避免中途乱序的页面结果停留在列表里（过滤与条数上限也就真正生效了）
+              if (Array.isArray(finalResults) && finalResults.length) {
+                this.bookCache = finalResults
+              }
               // 搜索期间用户可能已翻页，这里只做越界收敛，不强制回到第 1 页
               this.currentPage = Math.min(this.currentPage, this.totalPages)
               if (!this.bookCache.length) {
@@ -1034,6 +1035,7 @@
               if (this._searchCancelled) return
               this.isSearching = false
               this.searchScanDone = this.searchScanTotal
+              this._flushPageBuffer()
               this.showNotice('搜索失败：' + err.message, 'error')
             }
           })
@@ -1048,6 +1050,30 @@
         }
       },
 
+      /** 搜索结果按页批量合并：每页都触发整表重渲染会在上千行时明显掉帧 */
+      _queuePage(page) {
+        this._pageBuffer.push(...page)
+        if (this._pageFlushTimer) return
+        this._pageFlushTimer = setTimeout(() => {
+          this._pageFlushTimer = null
+          this._flushPageBuffer()
+        }, 150)
+      },
+
+      _flushPageBuffer() {
+        this._clearPageFlushTimer()
+        if (!this._pageBuffer || !this._pageBuffer.length) return
+        this.bookCache = this.bookCache.concat(this._pageBuffer)
+        this._pageBuffer = []
+      },
+
+      _clearPageFlushTimer() {
+        if (this._pageFlushTimer) {
+          clearTimeout(this._pageFlushTimer)
+          this._pageFlushTimer = null
+        }
+      },
+
       /** 停止正在进行的聚合搜索 */
       cancelSearch() {
         this._searchCancelled = true
@@ -1058,6 +1084,7 @@
         }
         this.isSearching = false
         this.searchScanDone = this.searchScanTotal
+        this._flushPageBuffer()
         if (this.bookCache.length) this.saveSearchHistory(this.searchKeyword.trim(), this.bookCache)
         this.showNotice('已停止搜索')
       },

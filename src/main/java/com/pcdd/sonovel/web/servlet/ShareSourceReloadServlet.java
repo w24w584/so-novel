@@ -19,11 +19,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 手动增量读取额外书源，通过 SSE 逐条推送进度给前端。
+ * <p>
+ * 推荐前端用 POST + fetch 流：EventSource 读不到 409 这类错误的状态码与响应体。
  */
 public class ShareSourceReloadServlet extends HttpServlet {
 
     @Override
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        handle(req, resp);
+    }
+
+    @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        handle(req, resp);
+    }
+
+    private void handle(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         // 全量重解析几万条规则很重，多人同时点会把 CPU 打满：同一时刻只放行一个任务
         if (!ShareBookSourceLoader.tryBeginReload()) {
             RespUtils.writeError(resp, 409, "已有书源重读任务正在进行中，请稍后再试");

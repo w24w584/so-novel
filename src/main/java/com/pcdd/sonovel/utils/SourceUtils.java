@@ -226,8 +226,9 @@ public class SourceUtils {
     public List<java.util.Map<String, Object>> getShareSources() {
         // 把内置(main)书源作为第一个分组返回，与额外书源用相同的来源结构，前端可统一勾选、按标签切换
         List<java.util.Map<String, Object>> mainSources = new ArrayList<>();
-        for (Rule r : getActivatedRules()) {
-            mainSources.add(ShareBookSourceLoader.buildSourceItem("main", r.getId(), r));
+        for (int i = 0; i < getActivatedRules().size(); i++) {
+            Rule r = getActivatedRules().get(i);
+            mainSources.add(ShareBookSourceLoader.buildSourceItem("main", "main#" + r.getId(), i, r));
         }
         java.util.Map<String, Object> mainGroup = new java.util.LinkedHashMap<>();
         mainGroup.put("file", "main");

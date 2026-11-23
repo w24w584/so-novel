@@ -6,8 +6,11 @@ import cn.hutool.json.JSONUtil;
 import com.pcdd.sonovel.actions.AggregatedSearchAction;
 import com.pcdd.sonovel.core.AppConfigLoader;
 import com.pcdd.sonovel.model.SearchResult;
+import com.pcdd.sonovel.web.SearchCancellationRegistry;
 import com.pcdd.sonovel.web.util.RespUtils;
 import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,6 +23,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 public class AggregatedSearchServlet extends HttpServlet {
@@ -39,11 +43,13 @@ public class AggregatedSearchServlet extends HttpServlet {
         Set<Integer> mainSourceIds;
         String searchLimitStr;
         boolean precision;
+        String searchId;
         try {
             JSONObject body = JSONUtil.parseObj(readBody(req));
             name = body.getStr("kw");
             searchLimitStr = body.getStr("searchLimit");
             precision = Boolean.TRUE.equals(body.getBool("precision", false));
+            searchId = body.getStr("searchId");
             List<String> ids = body.getJSONArray("shareSourceIds") == null
                     ? List.of() : body.getJSONArray("shareSourceIds").toList(String.class);
             shareSourceIds = parseIds(ids.toArray(new String[0]));
@@ -73,11 +79,36 @@ public class AggregatedSearchServlet extends HttpServlet {
 
         Object writeLock = new Object();
         AtomicBoolean closed = new AtomicBoolean(false);
+        // 前端点「停止」时用 searchId 精确取消；同时保留“写失败视为断开”的兜底
+        String effectiveSearchId = StrUtil.isBlank(searchId) ? java.util.UUID.randomUUID().toString() : searchId;
+        AtomicBoolean cancelFlag = SearchCancellationRegistry.register(effectiveSearchId);
+        BooleanSupplier cancelled = () -> cancelFlag.get() || closed.get();
 
         // 聚合搜索可能持续数十秒，不能让请求线程一直阻塞：转异步 + 虚拟线程，
         // 这样并发用户再多也不会耗尽 Jetty 的请求线程
         AsyncContext async = req.startAsync();
         async.setTimeout(TimeUnit.MINUTES.toMillis(10));
+        // 客户端断开 / 超时 / 出错都置 closed：用户点「停止」后搜索侧不再派发剩余书源
+        async.addListener(new AsyncListener() {
+            @Override
+            public void onComplete(AsyncEvent event) {
+                closed.set(true);
+            }
+
+            @Override
+            public void onTimeout(AsyncEvent event) {
+                closed.set(true);
+            }
+
+            @Override
+            public void onError(AsyncEvent event) {
+                closed.set(true);
+            }
+
+            @Override
+            public void onStartAsync(AsyncEvent event) {
+            }
+        });
         ServletOutputStream output;
         try {
             output = resp.getOutputStream();
@@ -91,12 +122,14 @@ public class AggregatedSearchServlet extends HttpServlet {
                         name, shareSourceIds, mainSourceIds, precision,
                         batch -> sendSse(output, writeLock, closed, pageEvent(batch)),
                         (done, total, found, failed) ->
-                                sendSse(output, writeLock, closed, progressEvent(done, total, found, failed)));
+                                sendSse(output, writeLock, closed, progressEvent(done, total, found, failed)),
+                        cancelled);
 
                 sendSse(output, writeLock, closed, doneEvent(finalResults, maxResults));
             } catch (Exception e) {
                 sendSse(output, writeLock, closed, errorEvent(e.getMessage()));
             } finally {
+                SearchCancellationRegistry.unregister(effectiveSearchId);
                 if (!closed.get()) {
                     try {
                         output.flush();

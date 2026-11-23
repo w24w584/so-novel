@@ -14,6 +14,7 @@ import lombok.experimental.UtilityClass;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -89,9 +90,10 @@ public class ShareBookSourceLoader {
             Map<String, Object> group = new LinkedHashMap<>();
             group.put("file", file.name());
             List<Map<String, Object>> sourcesInFile = new ArrayList<>();
+            Map<String, Integer> seen = new HashMap<>();
             for (int i = 0; i < file.sources().size(); i++) {
                 Rule s = file.sources().get(i);
-                sourcesInFile.add(buildSourceItem(file.name(), i, s));
+                sourcesInFile.add(buildSourceItem(file.name(), sourceIdOf(file.name(), s, seen), i, s));
             }
             group.put("sources", sourcesInFile);
             grouped.add(group);
@@ -100,13 +102,43 @@ public class ShareBookSourceLoader {
     }
 
     /**
-     * 构造前端书源条目。{@code index} 为文件内下标；内置(main)书源传入其规则 id。
+     * 书源在其所属文件内、跨次读取稳定不变的标识：文件内下标会随 JSON 顺序变动而漂移，
+     * 用它做前端勾选的 key 会导致“勾了又静默失效/串到别的书源”，因此改用主页 url。
+     * <p>
+     * 同一文件里可能有重复 url 的重复条目，用 {@code seen} 记录出现次数并加 {@code ~n} 去重；
+     * 调用方需按文件内原始顺序遍历，才能得到与前端一致的 id。
      */
-    public Map<String, Object> buildSourceItem(String fileName, int index, Rule s) {
+    public static String sourceIdOf(String fileName, Rule s, Map<String, Integer> seen) {
+        return fileName + "#" + nextStableKey(seen, s);
+    }
+
+    /** 旧的单条写法，仅用于没有重复 url 的场景（保留兼容） */
+    public static String sourceIdOf(String fileName, Rule s) {
+        return fileName + "#" + stableKey(s);
+    }
+
+    private static String nextStableKey(Map<String, Integer> seen, Rule s) {
+        String base = stableKey(s);
+        int n = seen.merge(base, 1, Integer::sum);
+        return n == 1 ? base : base + "~" + n;
+    }
+
+    private static String stableKey(Rule s) {
+        String url = StrUtil.trimToEmpty(s.getUrl());
+        if (StrUtil.isNotBlank(url)) return url;
+        // 个别书源没有主页 url，退回名称；加前缀避免与 url 形式的 key 撞车
+        return "name:" + StrUtil.trimToEmpty(s.getName());
+    }
+
+    /**
+     * 构造前端书源条目。{@code sourceId} 由调用方给出（内置 main 书源用 main#id，额外书源用 文件名#url）；
+     * {@code indexInFile} 仅用于展示/排序。
+     */
+    public Map<String, Object> buildSourceItem(String fileName, String sourceId, int indexInFile, Rule s) {
         Map<String, Object> item = new LinkedHashMap<>();
-        item.put("sourceId", fileName + "#" + index);
+        item.put("sourceId", sourceId);
         item.put("file", fileName);
-        item.put("indexInFile", index);
+        item.put("indexInFile", indexInFile);
         item.put("name", s.getName());
         item.put("url", s.getUrl());
         item.put("disabled", s.isDisabled());
@@ -131,8 +163,8 @@ public class ShareBookSourceLoader {
         return loadSelected(selectedSourceIds, baseRuleCount, false);
     }
 
-    /** 缓存中的一条书源定义及其全局序号/文件内下标/所属文件（全局序号含被禁用条目，保证 id 稳定） */
-    private record IndexedSource(int index, int indexInFile, String fileName, Rule source) {
+    /** 缓存中的一条书源定义及其全局序号/文件内下标/所属文件/前端勾选 key（全局序号含被禁用条目，保证 id 稳定） */
+    private record IndexedSource(int index, int indexInFile, String fileName, String sourceId, Rule source) {
     }
 
     /** 遍历缓存中的可用书源定义（只读，不做拷贝） */
@@ -141,10 +173,14 @@ public class ShareBookSourceLoader {
         int index = 0;
         for (ShareFile file : getFiles()) {
             List<Rule> sources = file.sources();
+            Map<String, Integer> seen = new HashMap<>();
             for (int i = 0; i < sources.size(); i++) {
                 index++;
-                if (sources.get(i).isDisabled()) continue;
-                list.add(new IndexedSource(index, i, file.name(), sources.get(i)));
+                Rule s = sources.get(i);
+                // 即便被禁用也要参与计数，保证 id 与前端 sourceId 的序号口径一致
+                String sourceId = sourceIdOf(file.name(), s, seen);
+                if (s.isDisabled()) continue;
+                list.add(new IndexedSource(index, i, file.name(), sourceId, s));
             }
         }
         return list;
@@ -153,8 +189,7 @@ public class ShareBookSourceLoader {
     private List<Rule> loadSelected(Set<String> selectedSourceIds, int baseRuleCount, boolean includeAll) {
         List<Rule> result = new ArrayList<>();
         for (IndexedSource entry : indexedSources()) {
-            String sourceId = entry.fileName() + "#" + entry.indexInFile();
-            if (!includeAll && !selectedSourceIds.contains(sourceId)) continue;
+            if (!includeAll && !selectedSourceIds.contains(entry.sourceId())) continue;
             // 缓存里的是"书源定义"，多个并发搜索/下载会共用同一实例；
             // 这里必须拷贝一份再改写 id/sourceGroup，否则会产生跨请求的相互覆盖
             result.add(borrow(entry, baseRuleCount));
@@ -730,6 +765,8 @@ public class ShareBookSourceLoader {
                 if (items.isEmpty()) continue;
 
                 List<Map<String, Object>> sources = new ArrayList<>();
+                // 与 listSourcesGrouped 保持一致：同一文件内按原始顺序生成 id，重复 url 加 ~n
+                Map<String, Integer> seen = new HashMap<>();
                 for (int i = 0; i < items.size(); i++) {
                     int index = running.incrementAndGet();
                     Object value = items.get(i);
@@ -760,7 +797,7 @@ public class ShareBookSourceLoader {
                         continue;
                     }
 
-                    Map<String, Object> itemMap = buildSourceItem(fileName, i, rule);
+                    Map<String, Object> itemMap = buildSourceItem(fileName, sourceIdOf(fileName, rule, seen), i, rule);
                     sources.add(itemMap);
                     long cost = System.currentTimeMillis() - start;
                     String state = rule.isDisabled() ? "（解析完成，但不可用）" : "";

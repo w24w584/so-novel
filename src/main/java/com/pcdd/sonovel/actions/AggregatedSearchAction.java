@@ -22,6 +22,7 @@ import java.util.Scanner;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import static org.fusesource.jansi.AnsiRenderer.render;
@@ -108,13 +109,23 @@ public class AggregatedSearchAction {
 
     /**
      * 流式聚合搜索：限制并发保证稳定性，按完成顺序通过 onPage 推送各书源结果（可并行回调，需线程安全），
-     * 并通过 onProgress 上报扫描进度（已扫描书源数 / 总数 / 已命中条数 / 失败书源数）。所有书源都会执行，不做提前终止。
+     * 并通过 onProgress 上报扫描进度（已扫描书源数 / 总数 / 已命中条数 / 失败书源数）。
+     * 全部书源都会执行到结束，除非 {@code cancelled} 返回 true（例如 Web 端已断开连接）。
      */
     @SneakyThrows
     public static List<SearchResult> streamSearch(String kw, Set<String> shareSourceIds, Set<Integer> mainSel,
                                                   boolean precision,
                                                   Consumer<List<SearchResult>> onPage,
                                                   SearchProgress onProgress) {
+        return streamSearch(kw, shareSourceIds, mainSel, precision, onPage, onProgress, () -> false);
+    }
+
+    @SneakyThrows
+    public static List<SearchResult> streamSearch(String kw, Set<String> shareSourceIds, Set<Integer> mainSel,
+                                                  boolean precision,
+                                                  Consumer<List<SearchResult>> onPage,
+                                                  SearchProgress onProgress,
+                                                  BooleanSupplier cancelled) {
         Console.log("<== 搜索关键字 “{}”", kw);
         List<Source> searchableSources = SourceUtils.getSearchableSources(shareSourceIds, mainSel);
         int total = searchableSources.size();
@@ -125,10 +136,18 @@ public class AggregatedSearchAction {
         boolean dev = EnvUtils.isDev();
         int concurrency = AppConfigLoader.APP_CONFIG.getConcurrency();
         if (concurrency <= 0) concurrency = 20;
+        // 实际派发出去的书源数：取消后剩余的不算，日志里按它统计成功率
+        int dispatched = 0;
 
         try (VirtualThreadLimiter limiter = new VirtualThreadLimiter(concurrency)) {
             for (Source source : searchableSources) {
-                limiter.submit(() -> {
+                // 客户端已经断开时不再派发新任务，避免用户点过「停止」后后台还跑完上千个书源
+                if (cancelled.getAsBoolean()) {
+                    Console.log("<== 搜索已中断，剩余 {} 个书源不再派发", total - dispatched);
+                    break;
+                }
+                Runnable task = () -> {
+                    if (cancelled.getAsBoolean()) return;
                     List<SearchResult> raw = null;
                     try {
                         SearchParser parser = new SearchParser(source.config);
@@ -157,11 +176,21 @@ public class AggregatedSearchAction {
                             onProgress.onProgress(searched.incrementAndGet(), total, found.get(), failed.get());
                         }
                     }
-                });
+                };
+                dispatched++;
+                // 用 trySubmitAndWait 跟并发上限同步派发：否则上千个任务会被瞬间投完，
+                // 取消时只能等它们全部排队跑完，起不到“停止”的作用
+                if (!limiter.trySubmitAndWait(task, cancelled)) {
+                    Console.log("<== 搜索已中断，剩余 {} 个书源不再派发", total - dispatched);
+                    dispatched--; // 这条并未真正提交
+                    break;
+                }
             }
         }
 
-        Console.log("<== 聚合搜索完成：成功 {} / 失败 {} / 共 {} 个书源，命中 {} 条", total - failed.get(), failed.get(), total, found.get());
+        // 成功口径按“实际派发”算：取消后剩余书源没执行，不应计成成功
+        Console.log("<== 聚合搜索完成：成功 {} / 失败 {} / 共 {} 个书源（已派发 {}），命中 {} 条",
+                dispatched - failed.get(), failed.get(), total, dispatched, found.get());
         return SearchResultsHandler.filterAndSort(all, kw);
     }
 
