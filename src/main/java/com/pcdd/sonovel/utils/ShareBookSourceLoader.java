@@ -131,26 +131,43 @@ public class ShareBookSourceLoader {
         return loadSelected(selectedSourceIds, baseRuleCount, false);
     }
 
-    private List<Rule> loadSelected(Set<String> selectedSourceIds, int baseRuleCount, boolean includeAll) {
-        List<Rule> result = new ArrayList<>();
-        int sourceIndex = 0;
+    /** 缓存中的一条书源定义及其全局序号/文件内下标/所属文件（全局序号含被禁用条目，保证 id 稳定） */
+    private record IndexedSource(int index, int indexInFile, String fileName, Rule source) {
+    }
+
+    /** 遍历缓存中的可用书源定义（只读，不做拷贝） */
+    private List<IndexedSource> indexedSources() {
+        List<IndexedSource> list = new ArrayList<>();
+        int index = 0;
         for (ShareFile file : getFiles()) {
-            for (int i = 0; i < file.sources().size(); i++) {
-                Rule source = file.sources().get(i);
-                sourceIndex++;
-                if (source.isDisabled()) continue;
-                // 缓存里的是"书源定义"，多个并发搜索/下载会共用同一实例；
-                // 这里必须拷贝一份再改写 id/sourceGroup，否则会产生跨请求的相互覆盖
-                source = copyOf(source);
-                source.setId(baseRuleCount + sourceIndex);
-                source.setSourceGroup(file.name());
-                String sourceId = file.name() + "#" + i;
-                if (includeAll || selectedSourceIds.contains(sourceId)) {
-                    result.add(source);
-                }
+            List<Rule> sources = file.sources();
+            for (int i = 0; i < sources.size(); i++) {
+                index++;
+                if (sources.get(i).isDisabled()) continue;
+                list.add(new IndexedSource(index, i, file.name(), sources.get(i)));
             }
         }
+        return list;
+    }
+
+    private List<Rule> loadSelected(Set<String> selectedSourceIds, int baseRuleCount, boolean includeAll) {
+        List<Rule> result = new ArrayList<>();
+        for (IndexedSource entry : indexedSources()) {
+            String sourceId = entry.fileName() + "#" + entry.indexInFile();
+            if (!includeAll && !selectedSourceIds.contains(sourceId)) continue;
+            // 缓存里的是"书源定义"，多个并发搜索/下载会共用同一实例；
+            // 这里必须拷贝一份再改写 id/sourceGroup，否则会产生跨请求的相互覆盖
+            result.add(borrow(entry, baseRuleCount));
+        }
         return result;
+    }
+
+    /** 拷贝一条书源定义并补上运行时字段（id / sourceGroup） */
+    private Rule borrow(IndexedSource entry, int baseRuleCount) {
+        Rule source = copyOf(entry.source());
+        source.setId(baseRuleCount + entry.index());
+        source.setSourceGroup(entry.fileName());
+        return source;
     }
 
     /** 深拷贝一条书源规则（含各子规则与请求头），保证调用方可安全改写而不影响缓存 */
@@ -185,14 +202,22 @@ public class ShareBookSourceLoader {
 
     public Rule findById(int id, int baseRuleCount) {
         if (id <= baseRuleCount) return null;
-        return loadAll(baseRuleCount).stream().filter(source -> source.getId() == id).findFirst().orElse(null);
+        int wantedIndex = id - baseRuleCount;
+        // 只拷贝命中的那一条，避免每次按 id 取书源都复制全部书源
+        return indexedSources().stream()
+                .filter(entry -> entry.index() == wantedIndex)
+                .findFirst()
+                .map(entry -> borrow(entry, baseRuleCount))
+                .orElse(null);
     }
 
     public Rule findByUrl(String url, int baseRuleCount) {
         // 取最长的匹配前缀：https://a.com 与 https://a.com.cn 这类源共存时，避免被短前缀的书源抢先命中
-        return loadAll(baseRuleCount).stream()
-                .filter(source -> StrUtil.isNotBlank(source.getUrl()) && StrUtil.startWith(url, source.getUrl()))
-                .max(Comparator.comparingInt((Rule source) -> source.getUrl().length()))
+        return indexedSources().stream()
+                .filter(entry -> StrUtil.isNotBlank(entry.source().getUrl())
+                        && StrUtil.startWith(url, entry.source().getUrl()))
+                .max(Comparator.comparingInt((IndexedSource entry) -> entry.source().getUrl().length()))
+                .map(entry -> borrow(entry, baseRuleCount))
                 .orElse(null);
     }
 
