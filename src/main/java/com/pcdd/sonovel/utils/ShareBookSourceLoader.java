@@ -152,9 +152,10 @@ public class ShareBookSourceLoader {
     }
 
     public Rule findByUrl(String url, int baseRuleCount) {
+        // 取最长的匹配前缀：https://a.com 与 https://a.com.cn 这类源共存时，避免被短前缀的书源抢先命中
         return loadAll(baseRuleCount).stream()
-                .filter(source -> StrUtil.startWith(url, source.getUrl()))
-                .findFirst()
+                .filter(source -> StrUtil.isNotBlank(source.getUrl()) && StrUtil.startWith(url, source.getUrl()))
+                .max(Comparator.comparingInt((Rule source) -> source.getUrl().length()))
                 .orElse(null);
     }
 
@@ -258,7 +259,14 @@ public class ShareBookSourceLoader {
 
         if (hasAtJs || hasAngleBracketJs) {
             if (hasAngleBracketJs) {
-                searchUrl = "@js:" + StrUtil.subBetween(searchUrl, "<js>", "</js>");
+                // 缺 </js> 收尾时 subBetween 返回 null，需显式判空，否则会拼出 "@js:null" 这种无效规则
+                String inlineJs = StrUtil.subBetween(searchUrl, "<js>", "</js>");
+                if (StrUtil.isBlank(inlineJs)) {
+                    rule.setDisabled(true);
+                    rule.setDisabledReason("搜索规则 <js> 代码不完整（缺少 </js>）");
+                    return rule;
+                }
+                searchUrl = "@js:" + inlineJs;
             }
             searchRule.setUrl(searchUrl);
             searchRule.setMethod("get");

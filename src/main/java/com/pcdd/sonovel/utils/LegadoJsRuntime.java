@@ -27,6 +27,7 @@ import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
+import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -90,7 +91,21 @@ public class LegadoJsRuntime {
             v8.getGlobalObject().set("__sourceKey", StrUtil.nullToEmpty(sourceKey));
 
             String script = buildScript(jsCode);
-            String json = v8.getExecutor(script).executeString();
+            String json;
+            try {
+                json = v8.getExecutor(script).executeString();
+            } finally {
+                // 引擎归还池后会被下一个书源复用，必须清掉本次注入的 bridge/页面内容，
+                // 否则上一个书源的 HTML 会被长期持有，且其全局变量可能污染后续脚本
+                try {
+                    var global = v8.getGlobalObject();
+                    global.delete("__bridge");
+                    global.delete("__result");
+                    global.delete("__baseUrl");
+                    global.delete("__sourceKey");
+                } catch (Exception ignored) {
+                }
+            }
             return toItems(json);
         } catch (Exception e) {
             Console.error("<== 执行分享书源目录 JS 规则失败: {}", e.getMessage());
@@ -363,7 +378,11 @@ public class LegadoJsRuntime {
                 }
             }
             if (!hasUa) builder.addHeader(Header.USER_AGENT.toString(), RandomUA.generate());
-            if (!hasReferer) builder.addHeader(Header.REFERER.toString(), url.substring(0, url.indexOf('/', url.indexOf("://") + 3) + 1));
+            if (!hasReferer) {
+                // 只补 scheme://host[:port]，不带尾斜杠：部分站点会拒绝以 / 结尾的 Referer
+                String origin = originOf(url);
+                if (StrUtil.isNotBlank(origin)) builder.addHeader(Header.REFERER.toString(), origin);
+            }
 
             String requestBody = body;
             String method = options == null ? null : options.getStr("method");
@@ -393,6 +412,19 @@ public class LegadoJsRuntime {
                 }
                 String charset = options == null ? null : options.getStr("charset");
                 return new String(bytes, detectCharset(bytes, responseBody.contentType(), charset));
+            }
+        }
+
+        /** 取 scheme://host[:port]；URL 不合法时返回空串（此时不发送 Referer） */
+        private String originOf(String url) {
+            try {
+                URI uri = URI.create(url);
+                String host = uri.getHost();
+                if (StrUtil.isBlank(host)) return "";
+                int port = uri.getPort();
+                return uri.getScheme() + "://" + host + (port > 0 ? ":" + port : "");
+            } catch (Exception e) {
+                return "";
             }
         }
 
